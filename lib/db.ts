@@ -1,6 +1,6 @@
-import { Pool, neonConfig, type PoolConfig } from "@neondatabase/serverless";
-import ws from "ws";
+import { Pool, type PoolConfig } from "@neondatabase/serverless";
 
+import type { RateLimitStore } from "@/lib/api/rate-limit";
 import type { ChallengeOpportunity } from "@/lib/claimDrafts";
 import type { ClaimChallenger, ClaimData } from "@/lib/contract";
 import type { AgentApiKeyRecord } from "@/lib/agents/api-keys";
@@ -28,13 +28,6 @@ import type { CopyAuditRecord, CopyPermission } from "@/lib/copy-trading";
  * `.toLowerCase()` on a hash is a no-op that matches reality, so it stays: it
  * keeps a hash arriving from a differently-cased source comparable.
  */
-
-// Neon's @neondatabase/serverless uses WebSockets in Node — wire up the ws
-// implementation. In edge/serverless runtimes that don't ship a global
-// WebSocket, this is a no-op fallback (Vercel edge has its own native WS).
-if (typeof globalThis.WebSocket === "undefined") {
-  neonConfig.webSocketConstructor = ws as unknown as typeof WebSocket;
-}
 
 export interface ClaimRow {
   id: number;
@@ -84,6 +77,7 @@ export interface ClaimFilters {
   visibility?: string;
   isFinal?: boolean;
   limit?: number;
+  cursor?: number;
   orderBy?: "id_desc" | "updated_desc" | "deadline_asc" | "deadline_desc";
 }
 
@@ -126,7 +120,7 @@ const PRIVATE_CONTENT_FIELDS = [
   "settlement_rule",
 ] as const;
 
-interface SqlStatement {
+export interface SqlStatement {
   sql:   string;
   args?: ReadonlyArray<unknown>;
 }
@@ -135,7 +129,7 @@ interface SqlStatement {
  * Postgres schema. BIGINT for any value that could exceed 2^31 (stakes, deadlines).
  * On-conflict syntax is identical to SQLite since Postgres 9.5.
  */
-const SCHEMA_STATEMENTS: SqlStatement[] = [
+export const SCHEMA_STATEMENTS: SqlStatement[] = [
   { sql: `CREATE TABLE IF NOT EXISTS schema_migrations (
     migration_id TEXT PRIMARY KEY,
     schema_version SMALLINT NOT NULL UNIQUE,
@@ -180,6 +174,9 @@ const SCHEMA_STATEMENTS: SqlStatement[] = [
   { sql: "CREATE INDEX IF NOT EXISTS idx_claims_parent ON claims(parent_id)" },
   { sql: "CREATE INDEX IF NOT EXISTS idx_claims_visibility ON claims(visibility)" },
   { sql: "CREATE INDEX IF NOT EXISTS idx_claims_active ON claims(state, is_final)" },
+  { sql: "CREATE INDEX IF NOT EXISTS idx_claims_visibility_state ON claims(visibility, state)" },
+  { sql: "CREATE INDEX IF NOT EXISTS idx_claims_visibility_category ON claims(visibility, category)" },
+  { sql: "CREATE INDEX IF NOT EXISTS idx_claims_visibility_creator ON claims(visibility, creator)" },
   { sql: `CREATE TABLE IF NOT EXISTS challengers (
     claim_id BIGINT NOT NULL,
     address TEXT NOT NULL,
@@ -308,6 +305,20 @@ const SCHEMA_STATEMENTS: SqlStatement[] = [
   // (the envelope skew window has long since closed) and should be pruned.
   { sql: "ALTER TABLE agent_api_nonces ADD COLUMN IF NOT EXISTS expires_at BIGINT NOT NULL DEFAULT 0" },
   { sql: "CREATE INDEX IF NOT EXISTS idx_agent_api_nonces_expires ON agent_api_nonces(expires_at)" },
+  // Shared rate-limit buckets. One row per (dimension, key, window); the window
+  // is part of the primary key so a new window starts from zero without a
+  // delete. `expires_at` is epoch ms and rows past it are pruned by
+  // pruneExpiredRateLimits(). The atomic upsert in consumeRateLimit() is what
+  // makes the count hold across instances.
+  { sql: `CREATE TABLE IF NOT EXISTS rate_limit_buckets (
+    dimension TEXT NOT NULL,
+    bucket_key TEXT NOT NULL,
+    window_start BIGINT NOT NULL,
+    count BIGINT NOT NULL DEFAULT 0,
+    expires_at BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (dimension, bucket_key, window_start)
+  )` },
+  { sql: "CREATE INDEX IF NOT EXISTS idx_rate_limit_buckets_expires ON rate_limit_buckets(expires_at)" },
   { sql: `CREATE TABLE IF NOT EXISTS agent_api_keys (
     key_id TEXT PRIMARY KEY,
     agent_id TEXT NOT NULL,
@@ -327,6 +338,7 @@ const SCHEMA_STATEMENTS: SqlStatement[] = [
   // through the overlap window after rotation. Idempotent ALTER TABLE: Postgres
   // ignores the statement when the column already exists.
   { sql: "ALTER TABLE agent_api_keys ADD COLUMN IF NOT EXISTS expires_at BIGINT" },
+  { sql: "ALTER TABLE agent_api_keys ADD COLUMN IF NOT EXISTS scopes_json TEXT" },
   { sql: `CREATE TABLE IF NOT EXISTS agent_spend_permissions (
     permission_hash TEXT PRIMARY KEY,
     agent_id TEXT NOT NULL,
@@ -545,6 +557,15 @@ const SCHEMA_STATEMENTS: SqlStatement[] = [
    * definition never reach the chain and so cannot be rebuilt from it. Keeping them
    * is the only way to measure shadow-mode precision against human review before
    * autonomous publishing is switched on.
+   *
+   * Review queue state (review_status):
+   *   - queued: newly created, awaiting human review
+   *   - in_review: a reviewer has claimed it
+   *   - approved: human agreed, ready for publish (or already published)
+   *   - rejected: human disagreed, will not be published
+   *   - cancelled: creator cancelled before review (e.g. duplicate detected)
+   *   - stale: deadline passed without review, auto-expired
+   *   - dependency_failed: downstream dependency failed (oracle, preflight, etc.)
    */
   { sql: `CREATE TABLE IF NOT EXISTS market_proposals (
     proposal_id TEXT PRIMARY KEY,
@@ -569,10 +590,24 @@ const SCHEMA_STATEMENTS: SqlStatement[] = [
     /** Set when the proposal was actually published. */
     claim_id BIGINT,
     /** Human review outcome, filled in later: agree | disagree | unreviewed. */
-    review TEXT NOT NULL DEFAULT 'unreviewed'
+    review TEXT NOT NULL DEFAULT 'unreviewed',
+    /** Explicit review queue state for operational boundaries. */
+    review_status TEXT NOT NULL DEFAULT 'queued',
+    /** When the proposal entered the review queue (set on first queued). */
+    queued_at BIGINT,
+    /** When review was claimed by a reviewer. */
+    claimed_at BIGINT,
+    /** When review was completed (approved/rejected). */
+    reviewed_at BIGINT,
+    /** Reviewer address who claimed/completed the review. */
+    reviewer TEXT,
+    /** Reason for cancellation, staleness, or dependency failure. */
+    failure_reason TEXT
   )` },
   { sql: "CREATE INDEX IF NOT EXISTS idx_market_proposals_created ON market_proposals(created_at DESC)" },
   { sql: "CREATE INDEX IF NOT EXISTS idx_market_proposals_disposition ON market_proposals(disposition)" },
+  { sql: "CREATE INDEX IF NOT EXISTS idx_market_proposals_review_status ON market_proposals(review_status)" },
+  { sql: "CREATE INDEX IF NOT EXISTS idx_market_proposals_queued ON market_proposals(queued_at) WHERE review_status = 'queued'" },
   { sql: `CREATE TABLE IF NOT EXISTS market_series (
     series_id TEXT PRIMARY KEY,
     schema_version SMALLINT NOT NULL DEFAULT 1,
@@ -687,6 +722,19 @@ const SCHEMA_STATEMENTS: SqlStatement[] = [
   },
 ];
 
+/**
+ * The ordered schema definition applied by `ensureSchema`. Exposed so the
+ * snapshot gate (`lib/ops/schema-snapshot.ts`, `npm run check:schema-snapshot`)
+ * can fingerprint the exact statements a deployment will run — no database and
+ * no secrets required.
+ */
+export function getSchemaStatements(): ReadonlyArray<{
+  sql: string;
+  args?: ReadonlyArray<unknown>;
+}> {
+  return SCHEMA_STATEMENTS;
+}
+
 declare global {
   // eslint-disable-next-line no-var
   var __mimirDbPool:  Pool | undefined;
@@ -704,13 +752,13 @@ function getDbConnectionString(): string {
   return url;
 }
 
-function buildPool(): Pool {
+export function buildPool(): Pool {
   const cfg: PoolConfig = { connectionString: getDbConnectionString() };
   return new Pool(cfg);
 }
 
 /** Convert `?` placeholders to Postgres `$1, $2, ...` in source order. */
-function toPg(sql: string): string {
+export function toPg(sql: string): string {
   let i = 0;
   return sql.replace(/\?/g, () => `$${++i}`);
 }
@@ -718,14 +766,14 @@ function toPg(sql: string): string {
 async function execute(
   pool: Pool,
   stmt: SqlStatement,
-): Promise<{ rows: Array<Record<string, unknown>> }> {
+): Promise<{ rows: Array<Record<string, unknown>>; rowCount: number }> {
   const args = stmt.args ?? [];
   const sql = stmt.sql.includes("$") ? stmt.sql : toPg(stmt.sql);
   const result = await pool.query(sql, args as unknown[]);
-  return { rows: result.rows as Array<Record<string, unknown>> };
+  return { rows: result.rows as Array<Record<string, unknown>>, rowCount: result.rowCount ?? 0 };
 }
 
-async function ensureSchema(pool: Pool): Promise<void> {
+export async function ensureSchema(pool: Pool): Promise<void> {
   for (const stmt of SCHEMA_STATEMENTS) {
     await execute(pool, stmt);
   }
@@ -749,20 +797,20 @@ async function batchWrite(pool: Pool, statements: SqlStatement[]): Promise<void>
   }
 }
 
-function getNumber(value: unknown): number {
+export function getNumber(value: unknown): number {
   if (typeof value === "number") return value;
   if (typeof value === "bigint") return Number(value);
   if (typeof value === "string" && value.length > 0) return Number(value);
   return 0;
 }
 
-function getString(value: unknown): string {
+export function getString(value: unknown): string {
   if (typeof value === "string") return value;
   if (value == null) return "";
   return String(value);
 }
 
-function getNullableString(value: unknown): string | null {
+export function getNullableString(value: unknown): string | null {
   if (value == null) return null;
   return String(value);
 }
@@ -801,7 +849,7 @@ function normalizeClaimRow(row: Record<string, unknown>): ClaimRow {
   };
 }
 
-function normalizeChallengerRow(row: Record<string, unknown>): ChallengerRow {
+export function normalizeChallengerRow(row: Record<string, unknown>): ChallengerRow {
   return {
     claim_id: getNumber(row.claim_id),
     address: getString(row.address),
@@ -810,7 +858,7 @@ function normalizeChallengerRow(row: Record<string, unknown>): ChallengerRow {
   };
 }
 
-function normalizeChallengeOpportunityRow(
+export function normalizeChallengeOpportunityRow(
   row: Record<string, unknown>
 ): ChallengeOpportunityRow {
   return {
@@ -839,7 +887,7 @@ function normalizeChallengeOpportunityRow(
   };
 }
 
-function buildIndexedClaimRecord(claim: ClaimData): IndexedClaimRecord {
+export function buildIndexedClaimRecord(claim: ClaimData): IndexedClaimRecord {
   const visibility = claim.visibility ?? (claim.is_private ? "private" : "public");
   const isPrivate = visibility === "private" || Boolean(claim.is_private);
 
@@ -889,7 +937,7 @@ function buildIndexedClaimRecord(claim: ClaimData): IndexedClaimRecord {
   };
 }
 
-function buildClaimUpsertStatement(claim: ClaimData, timestamp: number): SqlStatement {
+export function buildClaimUpsertStatement(claim: ClaimData, timestamp: number): SqlStatement {
   const record = buildIndexedClaimRecord(claim);
   return {
     sql: `INSERT INTO claims (
@@ -966,7 +1014,7 @@ function buildClaimUpsertStatement(claim: ClaimData, timestamp: number): SqlStat
   };
 }
 
-function makeListPlaceholders(values: unknown[]): string {
+export function makeListPlaceholders(values: unknown[]): string {
   return values.map(() => "?").join(", ");
 }
 
@@ -1058,6 +1106,10 @@ export async function getClaimsByFilter(filters: ClaimFilters = {}): Promise<Cla
       break;
     case "id_desc":
     default:
+      if (typeof filters.cursor === "number") {
+        clauses.push("id < ?");
+        args.push(filters.cursor);
+      }
       orderBy = "ORDER BY id DESC";
       break;
   }
@@ -1224,7 +1276,7 @@ export async function setSyncMeta(key: string, value: string): Promise<void> {
   });
 }
 
-function buildChallengeOpportunityInsertStatement(args: {
+export function buildChallengeOpportunityInsertStatement(args: {
   locale: string;
   opportunity: ChallengeOpportunity;
   generatedAt: number;
@@ -1415,7 +1467,7 @@ export interface MarketRevenueSummary {
 }
 
 /** NUMERIC(78,0) comes back as a string from pg — parse it, never via Number(). */
-function getBigInt(value: unknown): bigint {
+export function getBigInt(value: unknown): bigint {
   if (typeof value === "bigint") return value;
   if (typeof value === "number") return BigInt(Math.trunc(value));
   if (typeof value === "string" && value.trim().length > 0) return BigInt(value.trim());
@@ -1443,6 +1495,18 @@ export interface MarketProposalRow {
   disposition: string;
   blocked_by: string | null;
   claim_id: number | null;
+  /** Explicit review queue state. */
+  review_status: "queued" | "in_review" | "approved" | "rejected" | "cancelled" | "stale" | "dependency_failed";
+  /** When the proposal entered the review queue. */
+  queued_at: number | null;
+  /** When review was claimed by a reviewer. */
+  claimed_at: number | null;
+  /** When review was completed. */
+  reviewed_at: number | null;
+  /** Reviewer address who claimed/completed the review. */
+  reviewer: string | null;
+  /** Reason for cancellation, staleness, or dependency failure. */
+  failure_reason: string | null;
 }
 
 /**
@@ -1451,16 +1515,21 @@ export interface MarketProposalRow {
  * Idempotent on proposal_id: a worker retrying a run must not create a second
  * record of the same decision, or shadow-mode precision would be measured against
  * inflated counts.
+ *
+ * Sets queued_at to created_at when review_status is 'queued' (first insert only).
  */
 export async function insertMarketProposal(row: MarketProposalRow): Promise<void> {
   const pool = await getDb();
+  const now = row.created_at;
+  const queuedAt = row.review_status === "queued" ? now : row.queued_at;
   await execute(pool, {
     sql: `INSERT INTO market_proposals (
       proposal_id, created_at, question, creator_position, counter_position, category,
       subject_type, settlement_mode, product_modifiers, mode_rationale, stake_policy,
       context_pack_hash, resolution_url, settlement_rule, deadline, quality_score,
-      preflight_verdict, disposition, blocked_by, claim_id
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      preflight_verdict, disposition, blocked_by, claim_id,
+      review_status, queued_at, claimed_at, reviewed_at, reviewer, failure_reason
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT (proposal_id) DO NOTHING`,
     args: [
       row.proposal_id,
@@ -1483,8 +1552,132 @@ export async function insertMarketProposal(row: MarketProposalRow): Promise<void
       row.disposition,
       row.blocked_by,
       row.claim_id,
+      row.review_status,
+      queuedAt,
+      row.claimed_at,
+      row.reviewed_at,
+      row.reviewer,
+      row.failure_reason,
     ],
   });
+}
+
+/**
+ * Update the review queue status of a proposal.
+ * Handles state transitions with validation.
+ */
+export async function updateProposalReviewStatus(
+  proposalId: string,
+  status: MarketProposalRow["review_status"],
+  opts: { reviewer?: string; failureReason?: string } = {}
+): Promise<boolean> {
+  const pool = await getDb();
+  const now = Date.now();
+  let setClause = "review_status = ?";
+  const args: unknown[] = [status];
+
+  switch (status) {
+    case "in_review":
+      setClause += ", claimed_at = ?, reviewer = ?";
+      args.push(now, opts.reviewer ?? null);
+      break;
+    case "approved":
+    case "rejected":
+      setClause += ", reviewed_at = ?, reviewer = ?, review = ?";
+      args.push(now, opts.reviewer ?? null, status === "approved" ? "agree" : "disagree");
+      break;
+    case "cancelled":
+    case "stale":
+    case "dependency_failed":
+      setClause += ", reviewed_at = ?, failure_reason = ?";
+      args.push(now, opts.failureReason ?? null);
+      break;
+  }
+
+  const result = await execute(pool, {
+    sql: `UPDATE market_proposals SET ${setClause} WHERE proposal_id = ?`,
+    args: [...args, proposalId],
+  });
+  return (result.rowCount ?? 0) > 0;
+}
+
+/**
+ * Claim a proposal for review (sets status to in_review).
+ * Returns true if successfully claimed, false if already claimed or not queued.
+ */
+export async function claimProposalForReview(proposalId: string, reviewer: string): Promise<boolean> {
+  const pool = await getDb();
+  const now = Date.now();
+  const result = await execute(pool, {
+    sql: `UPDATE market_proposals
+          SET review_status = 'in_review', claimed_at = ?, reviewer = ?
+          WHERE proposal_id = ? AND review_status = 'queued'`,
+    args: [now, reviewer, proposalId],
+  });
+  return (result.rowCount ?? 0) > 0;
+}
+
+/**
+ * Complete a review (approve or reject).
+ * Returns true if successful, false if not in_review or already completed.
+ */
+export async function completeProposalReview(
+  proposalId: string,
+  reviewer: string,
+  approve: boolean
+): Promise<boolean> {
+  const pool = await getDb();
+  const now = Date.now();
+  const result = await execute(pool, {
+    sql: `UPDATE market_proposals
+          SET review_status = ?, reviewed_at = ?, reviewer = ?, review = ?
+          WHERE proposal_id = ? AND review_status = 'in_review' AND reviewer = ?`,
+    args: [approve ? "approved" : "rejected", now, reviewer, approve ? "agree" : "disagree", proposalId, reviewer],
+  });
+  return (result.rowCount ?? 0) > 0;
+}
+
+/**
+ * Mark proposals as stale (deadline passed without review).
+ * Call periodically via a cron/worker.
+ */
+export async function markStaleProposals(nowSeconds: number): Promise<number> {
+  const pool = await getDb();
+  const result = await execute(pool, {
+    sql: `UPDATE market_proposals
+          SET review_status = 'stale', reviewed_at = ?, failure_reason = 'review deadline passed'
+          WHERE review_status IN ('queued', 'in_review') AND deadline > 0 AND deadline < ?`,
+    args: [Date.now(), nowSeconds],
+  });
+  return result.rowCount ?? 0;
+}
+
+/**
+ * Cancel a proposal (e.g., duplicate detected, creator decision).
+ */
+export async function cancelProposal(proposalId: string, reason: string): Promise<boolean> {
+  const pool = await getDb();
+  const result = await execute(pool, {
+    sql: `UPDATE market_proposals
+          SET review_status = 'cancelled', reviewed_at = ?, failure_reason = ?
+          WHERE proposal_id = ? AND review_status IN ('queued', 'in_review')`,
+    args: [Date.now(), reason, proposalId],
+  });
+  return (result.rowCount ?? 0) > 0;
+}
+
+/**
+ * Mark a proposal as dependency_failed (e.g., oracle failure, preflight failure).
+ */
+export async function markProposalDependencyFailed(proposalId: string, reason: string): Promise<boolean> {
+  const pool = await getDb();
+  const result = await execute(pool, {
+    sql: `UPDATE market_proposals
+          SET review_status = 'dependency_failed', reviewed_at = ?, failure_reason = ?
+          WHERE proposal_id = ? AND review_status IN ('queued', 'in_review')`,
+    args: [Date.now(), reason, proposalId],
+  });
+  return (result.rowCount ?? 0) > 0;
 }
 
 /** Link a published claim back to the proposal that produced it. */
@@ -1564,6 +1757,29 @@ export async function upsertAgentRecord(agent: AgentRecord): Promise<void> {
       args: [agent.agentId, capability, agent.updatedAt],
     });
   }
+}
+
+/**
+ * Store an observational reputation recomputation.
+ *
+ * Deliberately its own statement rather than a reuse of `upsertAgentRecord`:
+ * the sync worker refreshes reputation for every agent on every pass, and a
+ * full-row upsert would rewrite limits, status and capabilities from a stale
+ * in-memory copy just to move one display column. Reputation is observational —
+ * this UPDATE is the only writer, and it touches nothing an authorization path
+ * reads.
+ */
+export async function updateAgentReputationBps(
+  agentId: string,
+  reputationBps: number,
+  at: number,
+): Promise<void> {
+  const pool = await getDb();
+  await execute(pool, {
+    sql: `UPDATE agent_registry SET reputation_bps = ?, updated_at = ?
+      WHERE agent_id = ?`,
+    args: [reputationBps, at, agentId],
+  });
 }
 
 export async function getAgentRecord(agentId: string): Promise<AgentRecord | null> {
@@ -1676,7 +1892,8 @@ export async function saveCopyPermission(permission: CopyPermission, at = Date.n
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(permission_id) DO UPDATE SET policy_json=excluded.policy_json,
       status=excluded.status, updated_at=excluded.updated_at,
-      revoked_at=CASE WHEN excluded.status='revoked' THEN excluded.updated_at ELSE copy_permissions.revoked_at END`,
+      revoked_at=CASE WHEN excluded.status='revoked' THEN excluded.updated_at ELSE copy_permissions.revoked_at END
+      WHERE copy_permissions.status <> 'revoked'`,
     args: [permission.permissionId, permission.ownerWallet, permission.executionAgentId,
       permission.signalAgentId, JSON.stringify(permission, (_, v) => typeof v === "bigint" ? v.toString() : v),
       permission.signedPolicyHash, permission.status, at, at],
@@ -1871,7 +2088,7 @@ export async function getAgentEarningsSummary(payoutWallet: string): Promise<{
   return { ownerFeesAtomic: getBigInt(row.owner_fees), unclaimedAtomic: getBigInt(row.unclaimed), x402Atomic: getBigInt(row.x402) };
 }
 
-export async function getPaymentsRevenueSummary(limit = 25): Promise<PaymentsRevenueSummary> {
+export async function getPaymentsRevenueSummary(limit = 25, offset = 0): Promise<PaymentsRevenueSummary> {
   const pool = await getDb();
   const [totals, byResource, bySeller, recent] = await Promise.all([
     execute(pool, {
@@ -1895,8 +2112,8 @@ export async function getPaymentsRevenueSummary(limit = 25): Promise<PaymentsRev
       sql: `SELECT resource, scheme, network, asset_address, asset_symbol, asset_decimals,
               amount_atomic, payer, seller, transaction_hash, payment_identifier,
               facilitator, settled_at, created_at
-            FROM payments_v2 ORDER BY settled_at DESC, id DESC LIMIT ?`,
-      args: [limit],
+            FROM payments_v2 ORDER BY settled_at DESC, id DESC LIMIT ? OFFSET ?`,
+      args: [limit, offset],
     }),
   ]);
   const t = totals.rows[0] ?? {};
@@ -1961,7 +2178,7 @@ export interface ReasoningEventRow {
   tombstone_reason: string | null;
 }
 
-function normalizeReasoningRow(row: Record<string, unknown>): ReasoningEventRow {
+export function normalizeReasoningRow(row: Record<string, unknown>): ReasoningEventRow {
   return {
     event_id: getString(row.event_id),
     schema_version: getNumber(row.schema_version),
@@ -2060,6 +2277,21 @@ export async function getReasoningFeed(filters: ReasoningFeedFilters): Promise<R
 }
 
 /**
+ * Cheap count of active reasoning events for a claim (used by SSE change detection).
+ * Excludes withheld and tombstoned rows.
+ */
+export async function getReasoningCount(claimId: number): Promise<number> {
+  const pool = await getDb();
+  const result = await execute(pool, {
+    sql: `SELECT COUNT(*) AS count FROM agent_reasoning_events
+      WHERE claim_id = ? AND visibility <> 'withheld' AND tombstoned_at IS NULL`,
+    args: [claimId],
+  });
+  const row = result.rows[0];
+  return row ? getNumber(row.count) : 0;
+}
+
+/**
  * Withdraw an event. The row is kept and marked, never deleted — a deletion would
  * silently rewrite the record of what an agent said.
  */
@@ -2079,14 +2311,14 @@ export async function insertAgentApiKey(record: AgentApiKeyRecord): Promise<void
   const pool = await getDb();
   await execute(pool, {
     sql: `INSERT INTO agent_api_keys (
-      key_id, agent_id, key_hash, key_prefix, label, created_at, expires_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      key_id, agent_id, key_hash, key_prefix, label, created_at, expires_at, scopes_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     args: [record.keyId, record.agentId, record.keyHash, record.keyPrefix,
-      record.label, record.createdAt, record.expiresAt ?? null],
+      record.label, record.createdAt, record.expiresAt ?? null, record.scopes ? JSON.stringify(record.scopes) : null],
   });
 }
 
-function toApiKeyRecord(row: Record<string, unknown>): AgentApiKeyRecord {
+export function toApiKeyRecord(row: Record<string, unknown>): AgentApiKeyRecord {
   return {
     keyId: getString(row.key_id),
     agentId: getString(row.agent_id),
@@ -2098,6 +2330,7 @@ function toApiKeyRecord(row: Record<string, unknown>): AgentApiKeyRecord {
     expiresAt: row.expires_at == null ? undefined : getNumber(row.expires_at),
     revokedAt: row.revoked_at == null ? undefined : getNumber(row.revoked_at),
     revokedReason: row.revoked_reason == null ? undefined : getString(row.revoked_reason),
+    scopes: row.scopes_json ? JSON.parse(getString(row.scopes_json)) : undefined,
   };
 }
 
@@ -2191,7 +2424,7 @@ export async function upsertSpendPermission(record: SpendPermissionRecord): Prom
   });
 }
 
-function toSpendPermission(row: Record<string, unknown>): SpendPermissionRecord {
+export function toSpendPermission(row: Record<string, unknown>): SpendPermissionRecord {
   return {
     permissionHash: getString(row.permission_hash),
     agentId: getString(row.agent_id),
@@ -2357,27 +2590,17 @@ export async function getAgentTradeRows(address: string): Promise<AgentTradeRow[
   return rows;
 }
 
-/** Registry listing for the agents page. Revoked agents are shown, not hidden. */
-export async function listAgentRecords(limit = 100): Promise<AgentRecord[]> {
-  const pool = await getDb();
-  const [records, capabilities] = await Promise.all([
-    execute(pool, {
-      sql: "SELECT * FROM agent_registry ORDER BY created_at ASC LIMIT ?",
-      args: [limit],
-    }),
-    execute(pool, {
-      sql: "SELECT agent_id, capability FROM agent_capabilities WHERE revoked_at IS NULL",
-    }),
-  ]);
-
+function mapAgentRecords(
+  recordRows: unknown[], capabilityRows: unknown[],
+): AgentRecord[] {
   const byAgent = new Map<string, string[]>();
-  for (const raw of capabilities.rows) {
+  for (const raw of capabilityRows) {
     const row = raw as Record<string, unknown>;
     const id = getString(row.agent_id);
     byAgent.set(id, [...(byAgent.get(id) ?? []), getString(row.capability)]);
   }
 
-  return records.rows.map((raw) => {
+  return recordRows.map((raw) => {
     const row = raw as Record<string, unknown>;
     const agentId = getString(row.agent_id);
     let limits: AgentRecord["limits"];
@@ -2406,6 +2629,39 @@ export async function listAgentRecords(limit = 100): Promise<AgentRecord[]> {
   });
 }
 
+/** Registry listing for the agents page. Revoked agents are shown, not hidden. */
+export async function listAgentRecords(limit = 100): Promise<AgentRecord[]> {
+  const pool = await getDb();
+  const [records, capabilities] = await Promise.all([
+    execute(pool, {
+      sql: "SELECT * FROM agent_registry ORDER BY created_at ASC LIMIT ?",
+      args: [limit],
+    }),
+    execute(pool, {
+      sql: "SELECT agent_id, capability FROM agent_capabilities WHERE revoked_at IS NULL",
+    }),
+  ]);
+  return mapAgentRecords(records.rows, capabilities.rows);
+}
+
+/** Registry agents owned by this exact, case-sensitive Stellar address. */
+export async function listAgentRecordsByOwner(ownerWallet: string): Promise<AgentRecord[]> {
+  const pool = await getDb();
+  const records = await execute(pool, {
+    sql: "SELECT * FROM agent_registry WHERE owner_wallet = ? ORDER BY created_at ASC",
+    args: [ownerWallet],
+  });
+  if (records.rows.length === 0) return [];
+
+  const capabilities = await execute(pool, {
+    sql: `SELECT ac.agent_id, ac.capability FROM agent_capabilities ac
+      JOIN agent_registry ar ON ar.agent_id = ac.agent_id
+      WHERE ar.owner_wallet = ? AND ac.revoked_at IS NULL`,
+    args: [ownerWallet],
+  });
+  return mapAgentRecords(records.rows, capabilities.rows);
+}
+
 // ── User-created baskets ──────────────────────────────────────────────────────
 
 export interface StoredBasket {
@@ -2429,7 +2685,7 @@ export async function insertBasket(basket: StoredBasket): Promise<void> {
   });
 }
 
-function toBasket(row: Record<string, unknown>): StoredBasket {
+export function toBasket(row: Record<string, unknown>): StoredBasket {
   return {
     basketId: getString(row.basket_id),
     creatorWallet: getString(row.creator_wallet),

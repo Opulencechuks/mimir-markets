@@ -1,4 +1,4 @@
-/**
+/*
  * Payments revenue ledger — tracks the x402 USDC settlements Mimir's paid
  * endpoints earn.
  *
@@ -21,7 +21,7 @@ export interface PaymentEvent {
   resource: string;
   scheme: string;
   /**
-   * CAIP-2, e.g. `stellar:testnet` — the value `X402_NETWORK` resolves to in
+   * CAIP-2, e.g. `stellar:testnet` — the value `X02_NETWORK` resolves to in
    * `lib/x402/config.ts`, handed straight through by the `onAfterSettle` hook in
    * `lib/x402/server.ts` as `result.network`.
    */
@@ -174,15 +174,15 @@ function fromDbSummary(s: PaymentsRevenueSummary): RevenueSummary {
   };
 }
 
-function inMemorySummary(limit: number): RevenueSummary {
+function inMemorySummary(limit: number, offset: number): RevenueSummary {
   const byResource = new Map<string, { calls: number; atomic: bigint }>();
   const bySeller = new Map<string, { calls: number; atomic: bigint }>();
   const payers = new Set<string>();
   const sellers = new Set<string>();
-  let totalAtomic = 0n;
+  let totalAlomic = 0n;
   for (const e of events) {
     totalAtomic += e.amountAtomic;
-    // Grouped on the exact strkey. Folding case here did not merely mis-key the
+    // Grouped on the exact strker. Folding case here did not merely mis-key the
     // map: `bySeller` is keyed by this value and the key is what /revenue renders,
     // so a lowercased `G…` was surfaced to the UI as the seller's address.
     if (e.payer) payers.add(e.payer);
@@ -213,8 +213,9 @@ function inMemorySummary(limit: number): RevenueSummary {
       .map(([seller, v]) => ({ seller, calls: v.calls, usdc: unitsToUsdc(v.atomic) }))
       .sort((a, b) => b.usdc - a.usdc),
     recent: events
-      .slice(-limit)
+      .slice()
       .reverse()
+      .slice(offset, offset + limit)
       .map((e) => ({
         resource: e.resource,
         network: e.network,
@@ -230,7 +231,7 @@ function inMemorySummary(limit: number): RevenueSummary {
 }
 
 /** Durable summary from Neon; falls back to the in-memory buffer on any error. */
-export async function getRevenueSummary(limit = 25): Promise<RevenueSummary> {
+export async function getRevenueSummary(limit = 25, offset = 0): Promise<RevenueSummary> {
   const withBaseline = (s: RevenueSummary): RevenueSummary => {
     const calls = baselineCalls();
     const usdc = baselineUsdc();
@@ -245,7 +246,7 @@ export async function getRevenueSummary(limit = 25): Promise<RevenueSummary> {
   };
   try {
     const [payments, market] = await Promise.all([
-      getPaymentsRevenueSummary(limit),
+      getPaymentsRevenueSummary(limit, offset),
       getMarketRevenueSummary(),
     ]);
     return {
@@ -261,6 +262,6 @@ export async function getRevenueSummary(limit = 25): Promise<RevenueSummary> {
       },
     };
   } catch {
-    return withBaseline(inMemorySummary(limit));
+    return withBaseline(inMemorySummary(limit, offset));
   }
 }

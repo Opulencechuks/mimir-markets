@@ -28,8 +28,15 @@ import {
   checkSettlementGuards,
   parseVerdictPayload,
   dependencyFailure,
+  malformedFailure,
+  validateResearchCitation,
+  validateCitationsList,
+  MAX_VERDICT_CITATIONS,
+  MAX_CITATION_TITLE_CHARS,
+  MAX_CITATION_EXCERPT_CHARS,
   type VerdictPayload,
   type VerdictGuardContext,
+  type ResearchCitation,
 } from "../../lib/verdict";
 
 import {
@@ -38,21 +45,20 @@ import {
   VERDICT_LLM_SCHEMA,
   VERDICT_RETRY_SUFFIX,
 } from "../../lib/verdict-parser";
+import { extractJson } from "../../lib/llm";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /**
- * Minimal extractJson stub: returns the first {...} block found via regex.
- * Handles fenced code blocks (strips the fence first) and prose wrappers.
- * Good enough for the cases tests need to exercise; the real extractJson in
- * lib/llm.ts has full balanced-brace walking.
+ * extractJson stub: returns the first balanced {...} block.
+ * Handles fenced code blocks and prose wrappers.
  */
 function stubExtract(text: string): string | null {
   // Strip ```json ... ``` fences
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
   if (fenced) return fenced[1].trim();
   // Find first { ... } block
-  const m = text.match(/\{[\s\S]*\}/);
+  const m = text.match(/\{[^{}]*\}/);
   return m ? m[0] : null;
 }
 
@@ -68,26 +74,28 @@ function nullExtract(_: string): string | null {
 
 function validPayload(overrides: Partial<VerdictPayload> = {}): VerdictPayload {
   return {
-    verdict:     "CREATOR_WINS",
-    confidence:  85,
+    verdict: "CREATOR_WINS",
+    confidence: 85,
     explanation: "The evidence clearly supports Side A.",
     ...overrides,
   };
 }
 
 /** Serialise a VerdictPayload to the JSON string the LLM might emit. */
-function asLLMText(p: Partial<VerdictPayload> & { verdict?: unknown } = {}): string {
+function asLLMText(
+  p: Partial<VerdictPayload> & { verdict?: unknown } = {},
+): string {
   return JSON.stringify({ ...validPayload(), ...p });
 }
 
-const PAST   = 1_000_000;  // fixed "now" for guard tests
+const PAST = 1_000_000; // fixed "now" for guard tests
 const FUTURE = 2_000_000;
 
 function ctx(overrides: Partial<VerdictGuardContext>): VerdictGuardContext {
   return {
     claimState: "active",
-    deadline:   PAST - 3600,  // 1 hour in the past
-    nowSecs:    PAST,
+    deadline: PAST - 3600, // 1 hour in the past
+    nowSecs: PAST,
     ...overrides,
   };
 }
@@ -101,14 +109,14 @@ test("isVerdict accepts all four canonical strings", () => {
 });
 
 test("isVerdict rejects near-misses and non-strings", () => {
-  assert.equal(isVerdict("creator_wins"), false);    // wrong case
-  assert.equal(isVerdict("CREATOR WINS"), false);    // space not underscore
+  assert.equal(isVerdict("creator_wins"), false); // wrong case
+  assert.equal(isVerdict("CREATOR WINS"), false); // space not underscore
   assert.equal(isVerdict(""), false);
   assert.equal(isVerdict(null), false);
   assert.equal(isVerdict(undefined), false);
   assert.equal(isVerdict(42), false);
   assert.equal(isVerdict({}), false);
-  assert.equal(isVerdict("DRAW "), false);            // trailing space
+  assert.equal(isVerdict("DRAW "), false); // trailing space
 });
 
 test("isDecisiveVerdict is true only for the two money-moving sides", () => {
@@ -134,7 +142,14 @@ test("validateVerdictFields returns a normalised payload for a clean object", ()
 });
 
 test("validateVerdictFields returns null for an unknown verdict string", () => {
-  assert.equal(validateVerdictFields({ verdict: "SIDE_A", confidence: 80, explanation: "x" }), null);
+  assert.equal(
+    validateVerdictFields({
+      verdict: "SIDE_A",
+      confidence: 80,
+      explanation: "x",
+    }),
+    null,
+  );
 });
 
 test("validateVerdictFields returns null for a non-object input", () => {
@@ -145,29 +160,52 @@ test("validateVerdictFields returns null for a non-object input", () => {
 });
 
 test("validateVerdictFields clamps confidence to [0, 100]", () => {
-  const lo = validateVerdictFields({ verdict: "DRAW", confidence: -50, explanation: "" });
+  const lo = validateVerdictFields({
+    verdict: "DRAW",
+    confidence: -50,
+    explanation: "",
+  });
   assert.equal(lo!.confidence, 0);
-  const hi = validateVerdictFields({ verdict: "DRAW", confidence: 999, explanation: "" });
+  const hi = validateVerdictFields({
+    verdict: "DRAW",
+    confidence: 999,
+    explanation: "",
+  });
   assert.equal(hi!.confidence, 100);
 });
 
 test("validateVerdictFields rounds non-integer confidence", () => {
-  const r = validateVerdictFields({ verdict: "DRAW", confidence: 77.8, explanation: "" });
+  const r = validateVerdictFields({
+    verdict: "DRAW",
+    confidence: 77.8,
+    explanation: "",
+  });
   assert.equal(r!.confidence, 78);
 });
 
 test("validateVerdictFields coerces numeric string confidence", () => {
-  const r = validateVerdictFields({ verdict: "DRAW", confidence: "80", explanation: "" });
+  const r = validateVerdictFields({
+    verdict: "DRAW",
+    confidence: "80",
+    explanation: "",
+  });
   assert.equal(r!.confidence, 80);
 });
 
 test("validateVerdictFields defaults confidence to 50 when missing", () => {
-  const r = validateVerdictFields({ verdict: "UNRESOLVABLE", explanation: "no data" });
+  const r = validateVerdictFields({
+    verdict: "UNRESOLVABLE",
+    explanation: "no data",
+  });
   assert.equal(r!.confidence, 50);
 });
 
 test("validateVerdictFields defaults confidence to 50 when non-numeric", () => {
-  const r = validateVerdictFields({ verdict: "UNRESOLVABLE", confidence: "high", explanation: "" });
+  const r = validateVerdictFields({
+    verdict: "UNRESOLVABLE",
+    confidence: "high",
+    explanation: "",
+  });
   assert.equal(r!.confidence, 50);
 });
 
@@ -178,7 +216,11 @@ test("validateVerdictFields defaults explanation to empty string when absent", (
 
 test("validateVerdictFields truncates explanation to 500 chars", () => {
   const long = "x".repeat(600);
-  const r = validateVerdictFields({ verdict: "DRAW", confidence: 50, explanation: long });
+  const r = validateVerdictFields({
+    verdict: "DRAW",
+    confidence: 50,
+    explanation: long,
+  });
   assert.equal(r!.explanation.length, 500);
 });
 
@@ -187,11 +229,14 @@ test("validateVerdictFields ignores extra unknown fields", () => {
     verdict: "CREATOR_WINS",
     confidence: 90,
     explanation: "ok",
-    wallet: "G123",         // money field — must be silently ignored
+    wallet: "G123", // money field — must be silently ignored
     analytics: { foo: 1 },
   });
   assert.ok(r !== null);
-  assert.equal(Object.keys(r!).sort().join(","), "confidence,explanation,verdict");
+  assert.equal(
+    Object.keys(r!).sort().join(","),
+    "confidence,explanation,verdict",
+  );
 });
 
 // ── C. checkSettlementGuards ──────────────────────────────────────────────────
@@ -231,7 +276,9 @@ test("checkSettlementGuards: open state with past deadline is settleable", () =>
 });
 
 test("checkSettlementGuards: cancelled takes priority over stale", () => {
-  const err = checkSettlementGuards(ctx({ claimState: "cancelled", deadline: FUTURE }));
+  const err = checkSettlementGuards(
+    ctx({ claimState: "cancelled", deadline: FUTURE }),
+  );
   assert.equal(err!.reason, "cancelled");
 });
 
@@ -247,7 +294,11 @@ test("parseVerdictPayload: happy path returns ok=true with normalised payload", 
 
 test("parseVerdictPayload: all four verdicts parse successfully", () => {
   for (const v of VERDICTS) {
-    const text = JSON.stringify({ verdict: v, confidence: 75, explanation: "ok" });
+    const text = JSON.stringify({
+      verdict: v,
+      confidence: 75,
+      explanation: "ok",
+    });
     const r = parseVerdictPayload(text, identityExtract);
     assert.ok(r.ok, `verdict "${v}" should parse`);
     assert.equal(r.payload.verdict, v);
@@ -255,7 +306,10 @@ test("parseVerdictPayload: all four verdicts parse successfully", () => {
 });
 
 test("parseVerdictPayload: no JSON => reason=invalid-json", () => {
-  const r = parseVerdictPayload("The creator clearly wins based on the evidence.", nullExtract);
+  const r = parseVerdictPayload(
+    "The creator clearly wins based on the evidence.",
+    nullExtract,
+  );
   assert.equal(r.ok, false);
   assert.equal(r.reason, "invalid-json");
 });
@@ -279,32 +333,47 @@ test("parseVerdictPayload: null JSON value => reason=invalid-json", () => {
 });
 
 test("parseVerdictPayload: verdict field absent => reason=missing-verdict", () => {
-  const r = parseVerdictPayload('{"confidence":80,"explanation":"ok"}', identityExtract);
+  const r = parseVerdictPayload(
+    '{"confidence":80,"explanation":"ok"}',
+    identityExtract,
+  );
   assert.equal(r.ok, false);
   assert.equal(r.reason, "missing-verdict");
 });
 
 test("parseVerdictPayload: verdict field is a number => reason=missing-verdict", () => {
-  const r = parseVerdictPayload('{"verdict":1,"confidence":80,"explanation":"ok"}', identityExtract);
+  const r = parseVerdictPayload(
+    '{"verdict":1,"confidence":80,"explanation":"ok"}',
+    identityExtract,
+  );
   assert.equal(r.ok, false);
   assert.equal(r.reason, "missing-verdict");
 });
 
 test("parseVerdictPayload: verdict field is null => reason=missing-verdict", () => {
-  const r = parseVerdictPayload('{"verdict":null,"confidence":80}', identityExtract);
+  const r = parseVerdictPayload(
+    '{"verdict":null,"confidence":80}',
+    identityExtract,
+  );
   assert.equal(r.ok, false);
   assert.equal(r.reason, "missing-verdict");
 });
 
 test("parseVerdictPayload: unknown verdict string => reason=invalid-verdict", () => {
-  const r = parseVerdictPayload('{"verdict":"SIDE_A","confidence":80,"explanation":"x"}', identityExtract);
+  const r = parseVerdictPayload(
+    '{"verdict":"SIDE_A","confidence":80,"explanation":"x"}',
+    identityExtract,
+  );
   assert.equal(r.ok, false);
   assert.equal(r.reason, "invalid-verdict");
   assert.ok(r.detail.includes("SIDE_A"));
 });
 
 test("parseVerdictPayload: wrong-case verdict => reason=invalid-verdict", () => {
-  const r = parseVerdictPayload('{"verdict":"creator_wins","confidence":80,"explanation":"x"}', identityExtract);
+  const r = parseVerdictPayload(
+    '{"verdict":"creator_wins","confidence":80,"explanation":"x"}',
+    identityExtract,
+  );
   assert.equal(r.ok, false);
   assert.equal(r.reason, "invalid-verdict");
 });
@@ -350,6 +419,40 @@ test("parseVerdictPayload: guard passes, then valid JSON => ok=true", () => {
   assert.equal(r.payload.verdict, "DRAW");
 });
 
+test("parseVerdictPayload: payload with valid citations parses cleanly", () => {
+  const text = JSON.stringify({
+    verdict: "CREATOR_WINS",
+    confidence: 85,
+    explanation: "Evidence verified.",
+    citations: [
+      {
+        url: "https://example.com/source",
+        contentHash: "abcdef0123456789",
+        capturedAt: 1700000000000,
+        title: "Official Source",
+        trustTier: "primary",
+      },
+    ],
+  });
+  const r = parseVerdictPayload(text, identityExtract);
+  assert.ok(r.ok);
+  assert.equal(r.payload.citations?.length, 1);
+  assert.equal(r.payload.citations?.[0].domain, "example.com");
+  assert.equal(r.payload.citations?.[0].contentHash, "abcdef0123456789");
+});
+
+test("parseVerdictPayload: malformed citations structure => reason=malformed", () => {
+  const text = JSON.stringify({
+    verdict: "CREATOR_WINS",
+    confidence: 85,
+    explanation: "Evidence verified.",
+    citations: "not-an-array",
+  });
+  const r = parseVerdictPayload(text, identityExtract);
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "malformed");
+});
+
 // ── E. parseVerdictText ───────────────────────────────────────────────────────
 
 test("parseVerdictText: happy path with prose wrapper via stubExtract", () => {
@@ -362,20 +465,27 @@ test("parseVerdictText: happy path with prose wrapper via stubExtract", () => {
 });
 
 test("parseVerdictText: fenced JSON block parses correctly", () => {
-  const llmOutput = "```json\n{\"verdict\":\"DRAW\",\"confidence\":55,\"explanation\":\"Tie.\"}\n```";
+  const llmOutput =
+    '```json\n{"verdict":"DRAW","confidence":55,"explanation":"Tie."}\n```';
   const r = parseVerdictText(llmOutput, stubExtract);
   assert.ok(r.ok);
   assert.equal(r.payload.verdict, "DRAW");
 });
 
 test("parseVerdictText: bare JSON with no wrappers parses correctly", () => {
-  const r = parseVerdictText('{"verdict":"UNRESOLVABLE","confidence":0,"explanation":"No data."}', identityExtract);
+  const r = parseVerdictText(
+    '{"verdict":"UNRESOLVABLE","confidence":0,"explanation":"No data."}',
+    identityExtract,
+  );
   assert.ok(r.ok);
   assert.equal(r.payload.verdict, "UNRESOLVABLE");
 });
 
 test("parseVerdictText: pure prose returns invalid-json", () => {
-  const r = parseVerdictText("Based on the evidence, the creator wins.", nullExtract);
+  const r = parseVerdictText(
+    "Based on the evidence, the creator wins.",
+    nullExtract,
+  );
   assert.equal(r.ok, false);
   assert.equal(r.reason, "invalid-json");
 });
@@ -413,7 +523,10 @@ test("parseVerdictText: JSON with extra top-level fields ignores them", () => {
   );
   assert.ok(r.ok);
   // wallet and price must NOT appear in the payload
-  assert.equal(Object.keys(r.payload).sort().join(","), "confidence,explanation,verdict");
+  assert.equal(
+    Object.keys(r.payload).sort().join(","),
+    "confidence,explanation,verdict",
+  );
 });
 
 test("parseVerdictText with guard: cancelled claim short-circuits before parse", () => {
@@ -448,11 +561,12 @@ test("parseLLMVerdictWithRetry: retries once on invalid-json and succeeds on att
   let calls = 0;
   const { result, attempts } = await parseLLMVerdictWithRetry({
     extractor: identityExtract,
-    buildPrompt: (attempt) => attempt === 2 ? "evaluate + JSON only" : "evaluate",
+    buildPrompt: (attempt) =>
+      attempt === 2 ? "evaluate + JSON only" : "evaluate",
     callLLMFn: async (_) => {
       calls++;
       return calls === 1
-        ? "The creator wins based on the evidence."   // no JSON
+        ? "The creator wins based on the evidence." // no JSON
         : asLLMText({ verdict: "CREATOR_WINS", confidence: 82 });
     },
   });
@@ -470,7 +584,7 @@ test("parseLLMVerdictWithRetry: retries once on missing-verdict", async () => {
     callLLMFn: async (_) => {
       calls++;
       return calls === 1
-        ? '{"confidence":80,"explanation":"ok"}'         // missing verdict
+        ? '{"confidence":80,"explanation":"ok"}' // missing verdict
         : asLLMText({ verdict: "DRAW", confidence: 60 });
     },
   });
@@ -487,7 +601,7 @@ test("parseLLMVerdictWithRetry: retries once on invalid-verdict string", async (
     callLLMFn: async (_) => {
       calls++;
       return calls === 1
-        ? '{"verdict":"WINNER_IS_CREATOR","confidence":80,"explanation":"x"}'  // invalid
+        ? '{"verdict":"WINNER_IS_CREATOR","confidence":80,"explanation":"x"}' // invalid
         : asLLMText({ verdict: "CREATOR_WINS", confidence: 80 });
     },
   });
@@ -513,12 +627,15 @@ test("parseLLMVerdictWithRetry: does NOT retry on guard-blocked (cancelled) clai
   const { result, attempts } = await parseLLMVerdictWithRetry({
     extractor: identityExtract,
     buildPrompt: (_) => "p",
-    callLLMFn: async (_) => { calls++; return asLLMText(); },
+    callLLMFn: async (_) => {
+      calls++;
+      return asLLMText();
+    },
     guardContext: ctx({ claimState: "cancelled" }),
   });
   assert.equal(result.ok, false);
   assert.equal(result.reason, "cancelled");
-  assert.equal(calls, 0);    // guard fires before any LLM call
+  assert.equal(calls, 0); // guard fires before any LLM call
   assert.equal(attempts, 1);
 });
 
@@ -527,7 +644,10 @@ test("parseLLMVerdictWithRetry: does NOT retry on duplicate (resolved) claim", a
   const { result } = await parseLLMVerdictWithRetry({
     extractor: identityExtract,
     buildPrompt: (_) => "p",
-    callLLMFn: async (_) => { calls++; return asLLMText(); },
+    callLLMFn: async (_) => {
+      calls++;
+      return asLLMText();
+    },
     guardContext: ctx({ claimState: "resolved" }),
   });
   assert.equal(result.ok, false);
@@ -540,7 +660,10 @@ test("parseLLMVerdictWithRetry: does NOT retry on stale claim", async () => {
   const { result } = await parseLLMVerdictWithRetry({
     extractor: identityExtract,
     buildPrompt: (_) => "p",
-    callLLMFn: async (_) => { calls++; return asLLMText(); },
+    callLLMFn: async (_) => {
+      calls++;
+      return asLLMText();
+    },
     guardContext: ctx({ deadline: FUTURE }),
   });
   assert.equal(result.ok, false);
@@ -561,7 +684,7 @@ test("parseLLMVerdictWithRetry: LLM throws => dependency-failure, no retry", asy
   assert.equal(result.ok, false);
   assert.equal(result.reason, "dependency-failure");
   assert.ok(result.detail.includes("API_KEY_INVALID"));
-  assert.equal(calls, 1);    // no retry after network/auth failure
+  assert.equal(calls, 1); // no retry after network/auth failure
   assert.equal(attempts, 1);
 });
 
@@ -569,7 +692,10 @@ test("parseLLMVerdictWithRetry: passes attempt number 1 and 2 to buildPrompt", a
   const seen: number[] = [];
   await parseLLMVerdictWithRetry({
     extractor: nullExtract,
-    buildPrompt: (attempt) => { seen.push(attempt); return "p"; },
+    buildPrompt: (attempt) => {
+      seen.push(attempt);
+      return "p";
+    },
     callLLMFn: async (_) => "no json",
   });
   assert.deepEqual(seen, [1, 2]);
@@ -580,15 +706,57 @@ test("parseLLMVerdictWithRetry: VERDICT_RETRY_SUFFIX is appended on attempt 2", 
   const BASE = "base-prompt";
   await parseLLMVerdictWithRetry({
     extractor: nullExtract,
-    buildPrompt: (attempt) => attempt === 1 ? BASE : `${BASE}${VERDICT_RETRY_SUFFIX}`,
-    callLLMFn: async (p) => { prompts.push(p); return "no json"; },
+    buildPrompt: (attempt) =>
+      attempt === 1 ? BASE : `${BASE}${VERDICT_RETRY_SUFFIX}`,
+    callLLMFn: async (p) => {
+      prompts.push(p);
+      return "no json";
+    },
   });
   assert.equal(prompts.length, 2);
   assert.equal(prompts[0], BASE);
   assert.ok(prompts[1].endsWith(VERDICT_RETRY_SUFFIX));
 });
 
-// ── G. dependencyFailure ──────────────────────────────────────────────────────
+test("parseLLMVerdictWithRetry: malformed payload triggers retry and succeeds on attempt 2", async () => {
+  let calls = 0;
+  const { result, attempts } = await parseLLMVerdictWithRetry({
+    extractor: identityExtract,
+    buildPrompt: (attempt) => `attempt-${attempt}`,
+    callLLMFn: async (prompt) => {
+      calls++;
+      if (prompt === "attempt-1") {
+        return JSON.stringify({
+          verdict: "CREATOR_WINS",
+          confidence: 80,
+          explanation: "ok",
+          citations: "invalid-not-array",
+        });
+      }
+      return JSON.stringify({
+        verdict: "CREATOR_WINS",
+        confidence: 80,
+        explanation: "ok",
+        citations: [
+          {
+            url: "https://example.com/source",
+            contentHash: "12345678",
+            capturedAt: 100,
+          },
+        ],
+      });
+    },
+  });
+  assert.equal(calls, 2);
+  assert.equal(attempts, 2);
+  assert.equal(result.ok, true);
+  if (result.ok) {
+    assert.equal(result.payload.verdict, "CREATOR_WINS");
+    assert.equal(result.payload.citations?.length, 1);
+  }
+});
+
+// ── G. Failure Constructors ───────────────────────────────────────────────────
 
 test("dependencyFailure returns a well-formed VerdictParseError", () => {
   const err = dependencyFailure("Evidence fetch timed out after 10s");
@@ -601,6 +769,13 @@ test("dependencyFailure: reason field is the dependency-failure discriminant", (
   const err = dependencyFailure("quorum not reached");
   const reason: string = err.reason;
   assert.equal(reason, "dependency-failure");
+});
+
+test("malformedFailure returns a well-formed VerdictParseError", () => {
+  const err = malformedFailure("Citations array exceeded maximum capacity");
+  assert.equal(err.ok, false);
+  assert.equal(err.reason, "malformed");
+  assert.ok(err.detail.includes("Citations"));
 });
 
 // ── H. Regression fixtures ────────────────────────────────────────────────────
@@ -635,13 +810,19 @@ test("regression: 512-token cap truncates explanation mid-string", () => {
 
 test("regression: confidence sent as string '80' by some model variants", () => {
   // Some Anthropic responses stringify numbers inside JSON.
-  const r = parseVerdictText('{"verdict":"DRAW","confidence":"80","explanation":"Equal evidence."}', identityExtract);
+  const r = parseVerdictText(
+    '{"verdict":"DRAW","confidence":"80","explanation":"Equal evidence."}',
+    identityExtract,
+  );
   assert.ok(r.ok);
-  assert.equal(r.payload.confidence, 80);   // coerced to number
+  assert.equal(r.payload.confidence, 80); // coerced to number
 });
 
 test("regression: confidence is 0 for UNRESOLVABLE (valid edge case)", () => {
-  const r = parseVerdictText('{"verdict":"UNRESOLVABLE","confidence":0,"explanation":"No data available."}', identityExtract);
+  const r = parseVerdictText(
+    '{"verdict":"UNRESOLVABLE","confidence":0,"explanation":"No data available."}',
+    identityExtract,
+  );
   assert.ok(r.ok);
   assert.equal(r.payload.verdict, "UNRESOLVABLE");
   assert.equal(r.payload.confidence, 0);
@@ -677,18 +858,128 @@ test("regression: money fields (wallet, price) in LLM response are stripped", ()
     identityExtract,
   );
   assert.ok(r.ok);
-  assert.equal(Object.keys(r.payload).sort().join(","), "confidence,explanation,verdict");
+  assert.equal(
+    Object.keys(r.payload).sort().join(","),
+    "confidence,explanation,verdict",
+  );
 });
 
 // ── I. VERDICT_LLM_SCHEMA shape ───────────────────────────────────────────────
 
 test("VERDICT_LLM_SCHEMA has required fields for Gemini structured output", () => {
   assert.equal(VERDICT_LLM_SCHEMA.type, "object");
-  assert.deepEqual([...VERDICT_LLM_SCHEMA.required].sort(), ["confidence", "explanation", "verdict"]);
+  assert.deepEqual([...VERDICT_LLM_SCHEMA.required].sort(), [
+    "confidence",
+    "explanation",
+    "verdict",
+  ]);
   assert.deepEqual(
     [...VERDICT_LLM_SCHEMA.properties.verdict.enum],
     ["CREATOR_WINS", "CHALLENGERS_WIN", "DRAW", "UNRESOLVABLE"],
   );
   assert.equal(VERDICT_LLM_SCHEMA.properties.confidence.type, "integer");
   assert.equal(VERDICT_LLM_SCHEMA.properties.explanation.type, "string");
+});
+
+// ── J. Research Citation Validation ──────────────────────────────────────────
+
+test("validateResearchCitation: positive full citation parses successfully", () => {
+  const valid = validateResearchCitation({
+    url: "https://api.coingecko.com/api/v3/coins/bitcoin",
+    contentHash: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    capturedAt: 1700000000000,
+    title: "CoinGecko API Bitcoin Snapshot",
+    trustTier: "primary",
+    excerpt: "Price was 95,000 USDC at 2026-01-01T00:00:00Z.",
+    fetcher: "coingecko-api",
+  });
+  assert.ok(valid !== null);
+  assert.equal(valid!.domain, "api.coingecko.com");
+  assert.equal(valid!.trustTier, "primary");
+  assert.equal(valid!.fetcher, "coingecko-api");
+  assert.equal(valid!.contentHash, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+});
+
+test("validateResearchCitation: negative rejects forbidden protocol (javascript, file, ftp)", () => {
+  assert.equal(validateResearchCitation({ url: "javascript:alert(1)", contentHash: "12345678", capturedAt: 100 }), null);
+  assert.equal(validateResearchCitation({ url: "file:///etc/passwd", contentHash: "12345678", capturedAt: 100 }), null);
+  assert.equal(validateResearchCitation({ url: "ftp://example.com/file", contentHash: "12345678", capturedAt: 100 }), null);
+});
+
+test("validateResearchCitation: negative rejects embedded basic auth credentials for privacy and secret safety", () => {
+  assert.equal(
+    validateResearchCitation({
+      url: "https://user:supersecretpass@example.com/api/v1",
+      contentHash: "12345678",
+      capturedAt: 100,
+    }),
+    null,
+  );
+});
+
+test("validateResearchCitation: negative rejects non-hex or out-of-range contentHash", () => {
+  assert.equal(validateResearchCitation({ url: "https://example.com", contentHash: "xyz12345", capturedAt: 100 }), null);
+  assert.equal(validateResearchCitation({ url: "https://example.com", contentHash: "1234", capturedAt: 100 }), null); // < 8 chars
+  assert.equal(validateResearchCitation({ url: "https://example.com", contentHash: "a".repeat(65), capturedAt: 100 }), null); // > 64 chars
+});
+
+test("validateResearchCitation: negative rejects invalid capturedAt", () => {
+  assert.equal(validateResearchCitation({ url: "https://example.com", contentHash: "12345678", capturedAt: -10 }), null);
+  assert.equal(validateResearchCitation({ url: "https://example.com", contentHash: "12345678", capturedAt: "never" }), null);
+});
+
+test("validateResearchCitation: boundary truncates title and excerpt to safe bounds", () => {
+  const longTitle = "T".repeat(MAX_CITATION_TITLE_CHARS + 50);
+  const longExcerpt = "E".repeat(MAX_CITATION_EXCERPT_CHARS + 50);
+  const valid = validateResearchCitation({
+    url: "https://example.com",
+    contentHash: "12345678",
+    capturedAt: 100,
+    title: longTitle,
+    excerpt: longExcerpt,
+  });
+  assert.ok(valid !== null);
+  assert.equal(valid!.title?.length, MAX_CITATION_TITLE_CHARS);
+  assert.equal(valid!.excerpt?.length, MAX_CITATION_EXCERPT_CHARS);
+});
+
+test("validateCitationsList: boundary rejects > MAX_VERDICT_CITATIONS", () => {
+  const list = Array.from({ length: MAX_VERDICT_CITATIONS + 1 }, (_, i) => ({
+    url: `https://example.com/${i}`,
+    contentHash: "12345678",
+    capturedAt: 100,
+  }));
+  const res = validateCitationsList(list);
+  assert.equal(res.ok, false);
+  assert.ok(res.error?.includes("Exceeded maximum citations limit"));
+});
+
+test("validateCitationsList: negative rejects non-array", () => {
+  const res = validateCitationsList("not-an-array");
+  assert.equal(res.ok, false);
+  assert.ok(res.error?.includes("must be an array"));
+});
+
+test("validateCitationsList: fails closed if any citation element is invalid", () => {
+  const list = [
+    { url: "https://valid.com", contentHash: "12345678", capturedAt: 100 },
+    { url: "invalid-url", contentHash: "12345678", capturedAt: 100 },
+  ];
+  const res = validateCitationsList(list);
+  assert.equal(res.ok, false);
+  assert.ok(res.error?.includes("invalid or malformed"));
+});
+
+test("validateCitationsList: positive valid list returns all citations", () => {
+  const list = [
+    { url: "https://valid1.com", contentHash: "12345678", capturedAt: 100 },
+    { url: "https://valid2.com", contentHash: "87654321", capturedAt: 200 },
+  ];
+  const res = validateCitationsList(list);
+  assert.equal(res.ok, true);
+  if (res.ok && res.citations) {
+    assert.equal(res.citations.length, 2);
+    assert.equal(res.citations[0].domain, "valid1.com");
+    assert.equal(res.citations[1].domain, "valid2.com");
+  }
 });

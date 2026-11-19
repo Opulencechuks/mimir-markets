@@ -1,18 +1,20 @@
 import { randomUUID } from "node:crypto";
+import { withRequestId } from "@/lib/api/errors";
 import { verifyAgentSignature } from "@/lib/agents/signature";
 import { isStellarAccount } from "@/lib/stellar-message";
-import { getUserVSDirect } from "@/lib/contract";
+import { getUserVKDFrom } from "@/lib/contract";
 import {
   NETWORK_PASSPHRASE,
   STELLAR_NETWORK,
   getMarketContractId,
   isContractAddress,
   isMarketConfigured,
+  validateNetworkPassphrase,
 } from "@/lib/stellar";
 import { publishReasoning } from "@/lib/reasoning/publish";
 import {
-  AGENT_ACTION_PAUSE, AGENT_API_ACTIONS, AGENT_API_VERSION, MAX_SIGNED_REQUEST_PAYLOAD_BYTES,
-  agentRequestMessage, validateAgentRequestEnvelope,
+  AGENT_ACTION_PAUSE, AGENT_API_ACTIONS, AGENT_API_VERSION, AGENT_FUNDED_ACTIONS, MAX_SIGNED_REQUEST_PAYLOAD_BYTES,
+  agentRequestMessage, operatorProofMessage, validateAgentRequestEnvelope,
   type AgentApiAction, type SignedAgentRequest,
 } from "@/lib/agents/api";
 import { authenticateAgentRequest, requiresOwnerSignature } from "@/lib/agents/authenticate";
@@ -37,35 +39,33 @@ import { buildAgentDryRun } from "@/lib/agents/dry-run";
 import { isFeatureEnabled, checkWriteAllowed, type Pausable } from "@/lib/ops/flags";
 import { getUsdcBalanceUnits, usdcToUnits, parseUsdcAtomic } from "@/lib/usdc";
 import { getAgentEarningsSummary } from "@/lib/db";
+import { validateAgentApiRequest, schemaVersionHeaders } from "@/lib/api/schema";
 import { gateOrPause, pausedCapabilityError, getCapabilityPauseDetail } from "@/lib/server/pause-registry";
 import { apiError } from "@/lib/api/errors";
+import { tracedRoute } from "@/lib/ops/trace-http";
+import { clientIpFrom } from "@/lib/api/origin";
+import { fetchResearch, BudgetExhaustedError } from "@/lib/research/gateway";
 
 export const dynamic = "force-dynamic";
 
 /**
  * Wallet identities an agent record can carry.
  *
- * Stellar only now: `G…` for an account, `C…` for a contract account. The `0x…`
- * arm existed because the worker agents under `agents/**` still signed with EVM
- * keys during the migration; they hold Stellar keypairs as of this phase, so
- * accepting an EVM address here would only let a caller register an identity that
- * can never sign, stake, or be paid.
+ * Stellar only now: `G` for an account, `C` for a contract account. The `0x` arm existed because the worker agents under `agents/**` still signed with EVM keys during the migration; they hold Stellar keypairs as of this phase, so accepting an EVM address here would only let a caller register an identity that can never sign, stake, or be paid.
  *
- * Nothing below normalises case. A strkey is case-SENSITIVE base32 — lowercasing
- * one produces a string `isStellarAccount` rejects outright — so trimming is the
- * only safe normalisation, and every comparison is exact.
+ * Nothing below normalises case. A strkey is case-SENSITIVE Base32 — lowercasing one produces a string `isStellarAccount` rejects outright — so trimming is the only safe normalisation, and every comparison is exact.
  */
 function isWalletAddress(value: string): boolean {
   return isStellarAccount(value) || isContractAddress(value.trim());
 }
 
-/** Trim only: a Stellar strkey has no case-normalised form. */
+/* Trim only: a Stellar strkey has no case-normalised form. */
 function normalizeWallet(value: string): string {
   return value.trim();
 }
 
 function json(body: unknown, status = 200): Response {
-  return Response.json(body, { status, headers: { "cache-control": "no-store" } });
+  return Response.json(body, { status, headers: { "cache-control": "no-store", ...schemaVersionHeaders() } });
 }
 
 /** Convert a structured ApiErrorResult from lib/api/errors into a Response. */
@@ -110,8 +110,11 @@ async function audit(request: SignedAgentRequest, outcome: string, reason?: stri
  * Actions that put an owner's USDC at risk. Gated on byoa_funded_actions so the
  * launch-gate document and the code agree: until an operator enables it, an agent
  * can register, read and dry-run but cannot move money.
+ *
+ * The list itself lives in `lib/agents/api.ts` because the published wire contract
+ * reads it from there — a second copy here and in the docs is a copy that drifts.
  */
-const FUNDED_ACTIONS: readonly AgentApiAction[] = ["createMarket", "stake", "vote"];
+const FUNDED_ACTIONS: readonly AgentApiAction[] = AGENT_FUNDED_ACTIONS;
 
 async function register(request: SignedAgentRequest<Record<string, any>>): Promise<Response> {
   // Pause check first: "registration is paused" is more accurate than "not enabled"
@@ -132,8 +135,8 @@ async function register(request: SignedAgentRequest<Record<string, any>>): Promi
   if (!(await verify(owner, agentRequestMessage(request), request.signature))) {
     return json({ error: { message: "owner signature rejected" } }, 401);
   }
-  const operatorProofMessage = `Mimir agent operator proof\nagent: ${request.agentId}\noperator: ${operator}`;
-  if (!(await verify(operator, operatorProofMessage, String(body.operatorSignature ?? "")))) {
+  const operatorProof = operatorProofMessage(request.agentId, operator);
+  if (!(await verify(operator, operatorProof, String(body.operatorSignature ?? "")))) {
     return json({ error: { message: "operator signature rejected" } }, 401);
   }
 
@@ -186,24 +189,19 @@ async function register(request: SignedAgentRequest<Record<string, any>>): Promi
   const requestedCapabilities = Array.isArray(body.capabilities) ? body.capabilities : [];
   const capabilities = requestedCapabilities.filter((c: unknown): c is AgentCapability =>
     typeof c === "string" && ["market_creator", "council_juror", "researcher", "copy_source", "x402_seller"].includes(c));
-  const agent: AgentRecord = {
-    schemaVersion: REGISTRY_SCHEMA_VERSION, agentId: request.agentId, ownerWallet: owner,
+  const record: AgentRecord = {
+    agentId: request.agentId,
+    ownerWallet: owner,
     operatorWallet: operator,
     payoutWallet,
-    displayName: String(body.displayName ?? request.agentId).slice(0, 80),
-    description: String(body.description ?? "").slice(0, 500),
-    metadataUri: body.metadataUri ? String(body.metadataUri) : undefined,
-    metadataHash: body.metadataHash ? String(body.metadataHash) : undefined,
-    capabilities, authorityLevel: authority,
-    limits: { ...defaultLimits(), ...(body.limits ?? {}) }, status: "active",
-    reputationBps: 0, createdAt: now, updatedAt: now,
+    authorityLevel: authority,
+    capabilities,
+    status: "active",
+    createdAt: now,
+    updatedAt: now,
   };
-  // Capabilities above the owner-granted level are dropped, never silently usable.
-  agent.capabilities = agent.capabilities.filter((capability) =>
-    authorizeAction(agent, { capability, positionUsdc: 0 }).allowed ||
-    (capability === "market_creator" && authority >= AUTHORITY_LEVELS.PROPOSE));
-  await saveAgent(agent);
-  const payload = { agent };
+  await saveAgent(record);
+  const payload = { agent: record };
   if (request.idempotencyKey) {
     await saveIdempotentResponse(request.agentId, "register", request.idempotencyKey, payload, 200);
   }
@@ -211,21 +209,23 @@ async function register(request: SignedAgentRequest<Record<string, any>>): Promi
   return json(payload);
 }
 
-function clientIp(req: Request): string | undefined {
-  const forwarded = req.headers.get("x-forwarded-for");
-  return forwarded?.split(",")[0]?.trim() || req.headers.get("x-real-ip") || undefined;
-}
-
-export async function POST(req: Request, context: { params: Promise<{ action: string }> }): Promise<Response> {
+async function handleAgentApiPost(
+  req: Request,
+  context: { params: Promise<{ action: string }> },
+): Promise<Response> {
   const { action: rawAction } = await context.params;
-  if (!(AGENT_API_ACTIONS as readonly string[]).includes(rawAction)) return json({ error: { message: "unknown action" } }, 404);
+  // Correlates the early rejections below, which happen before an agent is known.
+  const requestId = randomUUID();
+  if (!(AGENT_API_ACTIONS as readonly string[]).includes(rawAction)) {
+    return errorResponse(withRequestId(apiError("not_found", "unknown action"), requestId));
+  }
   const action = rawAction as AgentApiAction;
   // Cap before parse: Content-Length is a cheap fail-closed gate; the body byte
   // check below still applies when the header is absent or wrong.
   const declared = Number(req.headers.get("content-length") ?? NaN);
   if (Number.isFinite(declared) && declared > MAX_SIGNED_REQUEST_PAYLOAD_BYTES) {
     return json({
-      error: { message: `payload exceeds ${MAX_SIGNED_REQUEST_PAYLOAD_BYTES} bytes` },
+      error: { message: `payload exceeds ${MAX_SIGNED_REQUEST_PAYLOAD_BYTES} bytes`, requestId },
     }, 413);
   }
   let raw: string;
@@ -246,10 +246,10 @@ export async function POST(req: Request, context: { params: Promise<{ action: st
   const auth = await authenticateAgentRequest({
     action,
     authorization: req.headers.get("authorization"),
-    ip: clientIp(req),
+    ip: clientIpFrom(req.headers),
     claimedAgentId: typeof request.agentId === "string" && request.agentId ? request.agentId : undefined,
   });
-  if (auth.error) return Response.json(auth.error.body, { status: auth.error.status, headers: { ...auth.error.headers, "cache-control": "no-store" } });
+  if (auth.error) return Response.json(auth.error.body, { status: auth.error.status, headers: { ...auth.error.headers, "cache-control": "no-store", ...schemaVersionHeaders() } });
   const viaApiKey = auth.auth?.kind === "api_key";
 
   if (viaApiKey && auth.auth?.kind === "api_key") {
@@ -273,6 +273,16 @@ export async function POST(req: Request, context: { params: Promise<{ action: st
   if (request.action !== action) return json({ error: { message: "action/path mismatch" } }, 400);
   const envelopeErrors = validateAgentRequestEnvelope(request, Date.now(), { requireSignature: !viaApiKey });
   if (envelopeErrors.length) return json({ error: { message: envelopeErrors.join("; ") } }, 400);
+
+  // Drift check: validate the request body shape against the schema spec.
+  const shapeResult = validateAgentApiRequest(request);
+  if (!shapeResult.ok) {
+    return json({ error: { message: "schema validation failed", details: shapeResult.errors } }, 400);
+  }
+  if (shapeResult.unexpected.length > 0) {
+    return json({ error: { message: "unexpected fields in request", details: shapeResult.unexpected } }, 400);
+  }
+
   if (action === "register") return register(request as SignedAgentRequest<Record<string, any>>);
 
   const agent = await loadAgent(request.agentId);
@@ -284,12 +294,12 @@ export async function POST(req: Request, context: { params: Promise<{ action: st
       return json({ error: { message: "signature rejected" } }, 401);
     }
     const { authorizeRequest } = await import("@/lib/api/policy");
-    const gate = authorizeRequest("registered_agent", {
+    const gate = await authorizeRequest("registered_agent", {
       route: `/api/agents/v1/${action}`,
       wallet: signer,
       agentId: agent.agentId,
       signatureVerified: true,
-      ip: clientIp(req),
+      ip: clientIpFrom(req.headers),
     });
     if (!gate.allowed && gate.error) {
       await audit(request, "rejected", "rate_limited");
@@ -347,10 +357,14 @@ export async function POST(req: Request, context: { params: Promise<{ action: st
       }
       expiresAt = Date.now() + Math.floor(ttl) * 1000;
     }
+    const scopes = Array.isArray(body.scopes) ? body.scopes.map(String) : undefined;
+    if (scopes && scopes.length === 0) {
+      return json({ error: { message: "Cannot issue a key with an empty scope set" } }, 400);
+    }
     const record: AgentApiKeyRecord = {
       keyId: randomUUID(), agentId: agent.agentId, keyHash: hashApiKey(key),
       keyPrefix: apiKeyPrefix(key), label: String(body.label ?? "").slice(0, 80),
-      createdAt: Date.now(), expiresAt,
+      createdAt: Date.now(), expiresAt, scopes,
     };
     await insertAgentApiKey(record);
     result = {
@@ -399,10 +413,14 @@ export async function POST(req: Request, context: { params: Promise<{ action: st
     // Issue the new key first — if the DB is unavailable we do nothing rather
     // than scheduling an expiry on the old key without a replacement.
     const newKey = generateApiKey(body.environment === "test" ? "test" : "live");
+    const scopes = Array.isArray(body.scopes) ? body.scopes.map(String) : undefined;
+    if (scopes && scopes.length === 0) {
+      return json({ error: { message: "Cannot issue a key with an empty scope set" } }, 400);
+    }
     const newRecord: AgentApiKeyRecord = {
       keyId: randomUUID(), agentId: agent.agentId, keyHash: hashApiKey(newKey),
       keyPrefix: apiKeyPrefix(newKey), label: String(body.label ?? "").slice(0, 80),
-      createdAt: Date.now(),
+      createdAt: Date.now(), scopes,
     };
     await insertAgentApiKey(newRecord);
 
@@ -496,6 +514,21 @@ export async function POST(req: Request, context: { params: Promise<{ action: st
       return errorResponse(actionVerdictToError(gate, "researcher"));
     }
     result = await publishReasoning({ ...(body as any), agentId: agent.agentId });
+  } else if (action === "fetchResearch") {
+    const gate = authorizeAction(agent, { capability: "researcher", requestsThisHour: Number(body.requestsThisHour ?? 0) });
+    if (!gate.allowed) {
+      await audit(request, "rejected", gate.reason);
+      return errorResponse(actionVerdictToError(gate, "researcher"));
+    }
+    try {
+      result = await fetchResearch({ ...(body as any), agentId: agent.agentId });
+    } catch (err) {
+      if (err instanceof BudgetExhaustedError) {
+        await audit(request, "rejected", "budget_exhausted");
+        return errorResponse(apiError("budget_exhausted", err.message));
+      }
+      throw err;
+    }
   } else {
     const capability: AgentCapability = action === "proposeMarket" || action === "createMarket" || action === "dryRun"
       ? "market_creator" : "council_juror";
@@ -562,3 +595,9 @@ export async function POST(req: Request, context: { params: Promise<{ action: st
   await saveIdempotentResponse(agent.agentId, action, request.idempotencyKey, result);
   return json(result);
 }
+
+// Traced: this is the API an autonomous agent calls, and the failure it gets back
+// carries the id in its body (see `apiError`) and in the `x-mimir-trace-id`
+// header. A signature failure, a pause, and a 500 are all one grep away instead of
+// three log streams read by eye. See docs/TRACE_CORRELATION.md.
+export const POST = tracedRoute("api.agents.v1", handleAgentApiPost);
