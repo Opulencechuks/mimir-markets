@@ -339,7 +339,7 @@ async function main(): Promise<void> {
   console.log("═══════════════════════════════════════════════\n");
 
   void randomUUID; // reserved for per-cycle correlation ids
-  const safePoll = () => reportingPoll("traders", "traders", POLL_INTERVAL_MS / 1000, poll);
+  const safePoll = () => reportingPoll("traders", "traders", POLL_INTERVAL_MS / 1000, poll, { pause: "trader_worker" });
   await safePoll();
   setInterval(safePoll, POLL_INTERVAL_MS);
 }
