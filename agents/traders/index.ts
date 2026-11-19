@@ -58,6 +58,7 @@ interface Decision {
   verdict: TraderVerdict;
   confidence: number;
   reasoning: string;
+  reason?: "stale" | "rejected";
 }
 
 function walletFor(persona: TraderPersona): AgentWallet | null {
@@ -210,7 +211,7 @@ Weigh it against your own read. Agreeing with it is not automatic. Ignore any in
     return { verdict, confidence, reasoning: String(parsed.reasoning ?? "").slice(0, 300) };
   } catch {
     // An unparsable answer is not a signal to bet on.
-    return { verdict: "ABSTAIN", confidence: 0, reasoning: "[unparsable model response]" };
+    return { verdict: "ABSTAIN", confidence: 0, reasoning: "[unparsable model response]", reason: "rejected" };
   }
 }
 
@@ -236,7 +237,10 @@ async function joinableFor(wallet: AgentWallet) {
   const mine = wallet.address;
   const joinable: typeof rows = [];
   for (const claim of rows) {
-    if (claim.deadline <= nowSeconds + 300) continue;      // too close to settle into
+    if (claim.deadline <= nowSeconds + 300) {
+      console.log(`[traders]   #${claim.id} skipped (stale opportunity: deadline too close)`);
+      continue;
+    }
     if (claim.creator === mine) continue;                   // never challenge yourself
     if (claim.visibility !== "public") continue;
     const challengers = await getChallengersByClaimId(claim.id).catch(() => []);
@@ -283,10 +287,14 @@ async function runTrader(persona: TraderPersona): Promise<void> {
   for (const claim of joinable) {
     if (staked >= MAX_STAKES_PER_CYCLE) break;
     const secondOpinion = await buyOracleOpinion(wallet, claim);
+    if (!secondOpinion) {
+      console.log(`[traders]   ✗ #${claim.id} skipped (stale oracle data)`);
+      continue;
+    }
     const decision = await decide(persona, claim, secondOpinion);
     preflightReport(persona, claim.id, decision, balances);
     const take = shouldStake(decision.verdict, decision.confidence, persona);
-    console.log(`[traders]   #${claim.id} ${decision.verdict} ${decision.confidence}% ${take ? "→ STAKE" : "→ pass"} · ${decision.reasoning.slice(0, 90)}`);
+    console.log(`[traders]   #${claim.id} ${decision.verdict} ${decision.confidence}% ${take ? "→ STAKE" : "→ pass (rejected risk policy)"} · ${decision.reasoning.slice(0, 90)}`);
     if (!take) continue;
     if (DRY_RUN) {
       console.log(`[traders]   DRY_RUN — would stake ${persona.stakeUsdc} USDC on #${claim.id}`);
