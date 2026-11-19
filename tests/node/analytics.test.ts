@@ -1,3 +1,4 @@
+import "./helpers/stubs.cjs";
 import assert from "node:assert/strict";
 import test from "node:test";
 
@@ -5,13 +6,28 @@ import {
   ANALYTICS_EVENTS,
   EVENT_VERSION,
   buildEnvelope,
+  conformEventProperties,
   hasRequiredEnvelope,
   isAnalyticsEvent,
 } from "../../lib/analytics/events";
-import { containsRawAddress, redactProperties } from "../../lib/analytics/redact";
+import {
+  MAX_ARRAY_ITEMS,
+  MAX_BODY_BYTES,
+  MAX_DEPTH,
+  MAX_EVENT_PAYLOAD_BYTES,
+  MAX_PAYLOAD_BYTES,
+  MAX_PROPERTIES,
+  MAX_STRING_LENGTH,
+  containsRawAddress,
+  redactProperties,
+  redactWalletAddresses,
+  trimProperties,
+} from "../../lib/analytics/redact";
+import { POST, ingest } from "../../app/api/analytics/event/route";
 import {
   ANON_ACTOR_ID,
   actorIdForAddress,
+  opaqueAnalyticsId,
   resolveActor,
 } from "../../lib/analytics/actor";
 import { idempotencyKey } from "../../lib/analytics/events";
@@ -91,6 +107,15 @@ test("the envelope carries mode and claim context when supplied", () => {
 test("an incomplete envelope is detectable rather than shipped", () => {
   assert.equal(hasRequiredEnvelope({ network: "testnet", actor_type: "human" }), false);
   assert.equal(hasRequiredEnvelope({ event_version: 1, actor_type: "human" }), false);
+  assert.equal(
+    hasRequiredEnvelope({
+      event_version: EVENT_VERSION,
+      network: "testnet",
+      actor_type: "human",
+      source_surface: "attacker-controlled",
+    }),
+    false,
+  );
 });
 
 test("only declared event names are accepted", () => {
@@ -231,7 +256,177 @@ test("a raw wallet address in the payload is detectable", () => {
 });
 
 test("the contract address is public context, not a user identity", () => {
-  assert.equal(containsRawAddress({ contract: ADDRESS }), false);
+  assert.equal(containsRawAddress({ contract: `C${"A".repeat(55)}` }), false);
+  assert.equal(containsRawAddress({ contract: ADDRESS }), true);
+});
+
+test("raw Stellar identities are removed before capture", () => {
+  const contract = `C${"A".repeat(55)}`;
+  const { properties, dropped } = redactProperties({
+    wallet: ADDRESS,
+    nested: { owner: OTHER },
+    list: ["pool", ADDRESS],
+    contract,
+  });
+  assert.deepEqual(properties, { nested: {}, list: ["pool"], contract });
+  assert.deepEqual(dropped, ["wallet", "nested.owner", "list"]);
+});
+
+test("Stellar secret seeds are removed even under an innocent key", () => {
+  assert.deepEqual(redactProperties({ value: `S${"A".repeat(55)}` }).properties, {});
+});
+
+test("redaction bounds cyclic payloads without throwing", () => {
+  const cyclic: Record<string, unknown> = { claim_id: 1 };
+  cyclic.self = cyclic;
+  const result = redactProperties(cyclic);
+  assert.deepEqual(result.properties, { claim_id: 1, self: {} });
+  assert.deepEqual(result.dropped, ["self"]);
+});
+
+test("event schemas drop unknown, mistyped, and non-finite values", () => {
+  const result = conformEventProperties("stake_previewed", {
+    stake_bucket: "2-5",
+    upside_bps: 1200,
+    is_low_upside: false,
+    total_return_multiple: 2.2,
+    wallet: ADDRESS,
+    exact_stake: 2.3456789,
+    unsupported_mode: "false",
+  });
+  assert.deepEqual(result.properties, {
+    stake_bucket: "2-5",
+    upside_bps: 1200,
+    is_low_upside: false,
+    total_return_multiple: 2.2,
+  });
+  assert.deepEqual(result.dropped, ["wallet", "exact_stake", "unsupported_mode"]);
+  assert.deepEqual(
+    conformEventProperties("stake_previewed", { upside_bps: Number.POSITIVE_INFINITY }),
+    { properties: {}, dropped: ["upside_bps"] },
+  );
+  assert.deepEqual(
+    conformEventProperties("market_viewed", null),
+    { properties: {}, dropped: ["$payload"] },
+  );
+});
+
+// ── Wallet address redaction ──────────────────────────────────────────────────
+
+test("redactWalletAddresses drops raw wallet addresses from properties", () => {
+  const { properties, dropped } = redactWalletAddresses({ payer: ADDRESS, claim_id: 1 });
+  assert.equal("payer" in properties, false);
+  assert.equal(properties.claim_id, 1);
+  assert.deepEqual(dropped, ["payer"]);
+});
+
+test("redactWalletAddresses preserves contract address as public context", () => {
+  const { properties, dropped } = redactWalletAddresses({ contract: ADDRESS, claim_id: 1 });
+  assert.equal(properties.contract, ADDRESS);
+  assert.deepEqual(dropped, []);
+});
+
+test("redactWalletAddresses walks nested objects", () => {
+  const { properties, dropped } = redactWalletAddresses({
+    context: { seller: ADDRESS, claim_id: 5 },
+  });
+  assert.deepEqual(properties, { context: { claim_id: 5 } });
+  assert.deepEqual(dropped, ["context.seller"]);
+});
+
+test("redactWalletAddresses removes addresses from arrays", () => {
+  const { properties, dropped } = redactWalletAddresses({
+    participants: [ADDRESS, OTHER, "not-an-address"],
+  });
+  assert.deepEqual(properties.participants, ["not-an-address"]);
+  // Both individual element paths and the parent array path are reported
+  assert.deepEqual(dropped.sort(), ["participants", "participants[0]", "participants[1]"].sort());
+});
+
+test("redactWalletAddresses handles mixed nested arrays and objects", () => {
+  const { properties, dropped } = redactWalletAddresses({
+    data: { buyers: [ADDRESS], seller: OTHER, meta: { referrer: ADDRESS } },
+  });
+  // Both ADDRESS and OTHER are user wallet addresses — both are redacted.
+  // Only contract addresses are preserved as public context.
+  assert.deepEqual(properties, { data: { buyers: [], meta: {} } });
+  assert.deepEqual(dropped.sort(), ["data.buyers", "data.buyers[0]", "data.meta.referrer", "data.seller"].sort());
+});
+
+test("redactWalletAddresses does not drop actor ids (hashed, not raw)", () => {
+  const actorId = actorIdForAddress(ADDRESS, SALT)!;
+  const { properties, dropped } = redactWalletAddresses({ distinct_id: actorId, claim_id: 1 });
+  assert.equal(properties.distinct_id, actorId);
+  assert.deepEqual(dropped, []);
+});
+
+test("redactWalletAddresses does not drop agent ids", () => {
+  const { properties, dropped } = redactWalletAddresses({ distinct_id: "agent:oracle", claim_id: 1 });
+  assert.equal(properties.distinct_id, "agent:oracle");
+  assert.deepEqual(dropped, []);
+});
+
+// ── Boundary and negative tests for wallet address redaction ──────────────────
+
+test("redactWalletAddresses handles empty object", () => {
+  const { properties, dropped } = redactWalletAddresses({});
+  assert.deepEqual(properties, {});
+  assert.deepEqual(dropped, []);
+});
+
+test("redactWalletAddresses handles null and undefined values", () => {
+  const { properties, dropped } = redactWalletAddresses({
+    claim_id: 1,
+    nullable_field: null,
+    undefined_field: undefined,
+  });
+  assert.deepEqual(properties, { claim_id: 1 });
+  assert.deepEqual(dropped, []);
+});
+
+test("redactWalletAddresses does not drop EVM addresses (not Stellar strkeys)", () => {
+  const evmAddress = "0x1111111111111111111111111111111111111111";
+  const { properties, dropped } = redactWalletAddresses({ eth_address: evmAddress });
+  assert.equal(properties.eth_address, evmAddress);
+  assert.deepEqual(dropped, []);
+});
+
+test("redactWalletAddresses does not drop truncated address-like strings", () => {
+  const truncated = ADDRESS.slice(0, 50); // Too short to be a valid strkey
+  const { properties, dropped } = redactWalletAddresses({ partial: truncated });
+  assert.equal(properties.partial, truncated);
+  assert.deepEqual(dropped, []);
+});
+
+test("redactWalletAddresses preserves case-sensitive contract address exactly", () => {
+  // Contract addresses are compared verbatim — case matters for strkeys
+  const { properties, dropped } = redactWalletAddresses({
+    contract: ADDRESS,
+    other_field: ADDRESS,
+  });
+  assert.equal(properties.contract, ADDRESS);
+  assert.ok(!properties.other_field); // non-contract address is dropped
+  assert.deepEqual(dropped, ["other_field"]);
+});
+
+test("redactWalletAddresses drops address in deeply nested structure", () => {
+  const { properties, dropped } = redactWalletAddresses({
+    level1: { level2: { level3: { wallet: ADDRESS } } },
+  });
+  assert.deepEqual(properties, { level1: { level2: { level3: {} } } });
+  assert.deepEqual(dropped, ["level1.level2.level3.wallet"]);
+});
+
+test("redactWalletAddresses handles arrays with mixed types", () => {
+  const { properties, dropped } = redactWalletAddresses({
+    mixed: [ADDRESS, 123, "string", { nested: ADDRESS }, null, [OTHER]],
+  });
+  // Object keys containing addresses are dropped entirely (not kept as empty),
+  // consistent with nested object behavior.
+  assert.deepEqual(properties.mixed, [123, "string", {}, null, []]);
+  // Reports element paths for nested arrays; parent array "mixed" is reported
+  // at the top level, but nested array "mixed[5]" only reports its elements.
+  assert.deepEqual(dropped.sort(), ["mixed", "mixed[0]", "mixed[3].nested", "mixed[5][0]"].sort());
 });
 
 // ── Actor identity ────────────────────────────────────────────────────────────
@@ -258,7 +453,7 @@ test("different addresses get different actor ids", () => {
 });
 
 test("rotating the salt severs the link to the old id", () => {
-  assert.notEqual(actorIdForAddress(ADDRESS, SALT), actorIdForAddress(ADDRESS, "rotated"));
+  assert.notEqual(actorIdForAddress(ADDRESS, SALT), actorIdForAddress(ADDRESS, "rotated-salt-value"));
 });
 
 test("the actor id never contains the address", () => {
@@ -280,6 +475,7 @@ test("a malformed address yields no actor id", () => {
 
 test("without a salt the actor degrades to anonymous, never to a raw address", () => {
   assert.equal(actorIdForAddress(ADDRESS, null), null);
+  assert.equal(actorIdForAddress(ADDRESS, "too-short"), null);
   const actor = resolveActor({ address: ADDRESS, salt: null });
   assert.equal(actor.actorId, ANON_ACTOR_ID);
   assert.equal(actor.actorType, "anonymous");
@@ -307,6 +503,16 @@ test("an agent id is used verbatim and is not a wallet address", () => {
   assert.equal(containsRawAddress({ distinct_id: agent.actorId }), false);
 });
 
+test("unsafe agent ids degrade to anonymous before reaching distinct_id", () => {
+  for (const agentId of [undefined, ADDRESS, "oracle@example.com", "x".repeat(65)]) {
+    assert.deepEqual(resolveActor({ isAgent: true, agentId }), {
+      actorId: ANON_ACTOR_ID,
+      actorType: "anonymous",
+      degraded: true,
+    });
+  }
+});
+
 // ── Idempotency ───────────────────────────────────────────────────────────────
 
 test("the idempotency key is deterministic for the same logical step", () => {
@@ -327,6 +533,16 @@ test("undefined and empty parts are skipped so the key stays stable", () => {
   assert.equal(idempotencyKey(["a", undefined, "b"]), "a:b");
   assert.equal(idempotencyKey(["a", "", "b"]), "a:b");
 });
+
+test("capture idempotency ids are opaque and fail closed without a strong salt", () => {
+  const raw = `stake_confirmed:12:${ADDRESS}`;
+  const opaque = opaqueAnalyticsId(raw, SALT);
+  assert.equal(opaque?.length, 32);
+  assert.equal(opaque?.includes(ADDRESS), false);
+  assert.equal(opaqueAnalyticsId(raw, null), null);
+  assert.equal(opaqueAnalyticsId(raw, "too-short"), null);
+  assert.equal(opaqueAnalyticsId("x".repeat(513), SALT), null);
+});
 test("every roadmap success metric has an owned, non-financial-analytics source", () => {
   assert.equal(SUCCESS_METRICS.length, 11);
   assert.deepEqual(analyticsDefinitionErrors(), []);
@@ -334,3 +550,355 @@ test("every roadmap success metric has an owned, non-financial-analytics source"
     if (/revenue|pnl/i.test(metric.name)) assert.notEqual(metric.source, "posthog");
   }
 });
+
+// ── Property bounds and payload caps (issue #503) ────────────────────────────
+
+test("redaction and payload limit constants are exported and correctly bounded", () => {
+  assert.equal(MAX_EVENT_PAYLOAD_BYTES, 64 * 1024);
+  assert.equal(MAX_PAYLOAD_BYTES, 64 * 1024);
+  assert.equal(MAX_BODY_BYTES, 64 * 1024);
+  assert.equal(MAX_STRING_LENGTH, 200);
+  assert.equal(MAX_DEPTH, 5);
+  assert.equal(MAX_PROPERTIES, 64);
+  assert.equal(MAX_ARRAY_ITEMS, 32);
+});
+
+test("trimProperties trims key count to MAX_PROPERTIES", () => {
+  const input: Record<string, unknown> = {};
+  for (let i = 0; i < 100; i++) {
+    input[`prop_${i}`] = i;
+  }
+  const trimmed = trimProperties(input);
+  assert.equal(Object.keys(trimmed).length, MAX_PROPERTIES);
+  assert.equal(trimmed.prop_0, 0);
+  assert.equal(trimmed.prop_63, 63);
+  assert.equal("prop_64" in trimmed, false);
+});
+
+test("trimProperties trims string lengths to MAX_STRING_LENGTH", () => {
+  const trimmed = trimProperties({
+    short: "hello",
+    overlong: "x".repeat(500),
+  });
+  assert.equal(trimmed.short, "hello");
+  assert.equal((trimmed.overlong as string).length, MAX_STRING_LENGTH);
+  assert.equal(trimmed.overlong, "x".repeat(MAX_STRING_LENGTH));
+});
+
+test("trimProperties trims property keys that exceed MAX_STRING_LENGTH", () => {
+  const overlongKey = "k".repeat(300);
+  const trimmed = trimProperties({ [overlongKey]: "val" });
+  const keys = Object.keys(trimmed);
+  assert.equal(keys.length, 1);
+  assert.equal(keys[0].length, MAX_STRING_LENGTH);
+  assert.equal(keys[0], "k".repeat(MAX_STRING_LENGTH));
+});
+
+test("trimProperties bounds deeply nested payloads to MAX_DEPTH", () => {
+  // Build a 10-level deep structure: root is level 0
+  let deep: Record<string, unknown> = { leaf: "val" };
+  for (let i = 0; i < 10; i++) {
+    deep = { [`step_${i}`]: deep };
+  }
+
+  const trimmed = trimProperties(deep);
+
+  // Traverse down and verify nesting depth does not exceed MAX_DEPTH
+  let current: any = trimmed;
+  let depth = 0;
+  while (current && typeof current === "object" && !Array.isArray(current)) {
+    const keys = Object.keys(current);
+    if (keys.length === 0) break;
+    depth++;
+    current = current[keys[0]];
+  }
+  assert.ok(depth <= MAX_DEPTH, `depth was ${depth}, expected <= ${MAX_DEPTH}`);
+});
+
+test("trimProperties bounds arrays to MAX_ARRAY_ITEMS and trims their string members", () => {
+  const arr = Array.from({ length: 50 }, (_, i) => (i === 0 ? "s".repeat(300) : i));
+  const trimmed = trimProperties({ list: arr });
+  const resultList = trimmed.list as unknown[];
+  assert.equal(resultList.length, MAX_ARRAY_ITEMS);
+  assert.equal((resultList[0] as string).length, MAX_STRING_LENGTH);
+});
+
+test("trimProperties handles cyclic structures without infinite recursion", () => {
+  const cyclic: Record<string, unknown> = { key: "value" };
+  cyclic.self = cyclic;
+  const trimmed = trimProperties(cyclic);
+  assert.equal(trimmed.key, "value");
+  assert.deepEqual(trimmed.self, {});
+});
+
+test("trimProperties handles non-object and empty inputs gracefully", () => {
+  assert.deepEqual(trimProperties(null), {});
+  assert.deepEqual(trimProperties(undefined), {});
+  assert.deepEqual(trimProperties("a string"), {});
+  assert.deepEqual(trimProperties(42), {});
+  assert.deepEqual(trimProperties([]), {});
+  assert.deepEqual(trimProperties({}), {});
+});
+
+test("trimProperties preserves normal event properties untouched", () => {
+  const normal = {
+    stake_bucket: "2-10",
+    upside_bps: 1000,
+    is_low_upside: true,
+    total_return_multiple: 2.5,
+  };
+  assert.deepEqual(trimProperties(normal), normal);
+});
+
+test("redactProperties drops keys when properties exceed MAX_PROPERTIES", () => {
+  const input: Record<string, unknown> = {};
+  for (let i = 0; i < 80; i++) {
+    input[`p_${i}`] = i;
+  }
+  const { properties, dropped } = redactProperties(input);
+  assert.equal(Object.keys(properties).length, MAX_PROPERTIES);
+  assert.equal(dropped.length, 80 - MAX_PROPERTIES);
+  assert.ok(dropped.includes("p_64"));
+  assert.ok(dropped.includes("p_79"));
+});
+
+test("redactProperties drops nested levels when depth exceeds MAX_DEPTH", () => {
+  // Build a 9-level nested structure
+  let nested: Record<string, unknown> = { end: "done" };
+  for (let i = 0; i < 8; i++) {
+    nested = { [`level_${i}`]: nested };
+  }
+  const { properties, dropped } = redactProperties(nested);
+  assert.ok(dropped.length > 0);
+  // Verify that the deepest dropped path is recorded
+  assert.ok(dropped.some((path) => path.includes("level_5") || path.includes("level_6")));
+});
+
+// ── HTTP /api/analytics/event ingest caps ─────────────────────────────────────
+
+function createMockRequest(
+  body: string | object,
+  headers: Record<string, string> = {},
+): Request {
+  const bodyText = typeof body === "string" ? body : JSON.stringify(body);
+  return new Request("http://localhost/api/analytics/event", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...headers,
+    },
+    body: bodyText,
+  });
+}
+
+test("ingest drops oversized payloads exceeding MAX_EVENT_PAYLOAD_BYTES without forwarding", async () => {
+  let forwarded = false;
+  const mockCapture = async () => {
+    forwarded = true;
+    return { sent: true };
+  };
+
+  const hugeBody = JSON.stringify({
+    event: "market_viewed",
+    envelope: { source_surface: "home" },
+    properties: { big: "x".repeat(MAX_EVENT_PAYLOAD_BYTES + 100) },
+  });
+
+  const req = createMockRequest(hugeBody);
+  const response = await ingest(req, mockCapture as any);
+
+  assert.equal(response.status, 204);
+  assert.equal(forwarded, false, "oversized payload must be dropped without calling capture()");
+});
+
+test("ingest drops payloads with oversized Content-Length header without reading body", async () => {
+  let forwarded = false;
+  const mockCapture = async () => {
+    forwarded = true;
+    return { sent: true };
+  };
+
+  const req = createMockRequest(
+    { event: "market_viewed", envelope: { source_surface: "home" } },
+    { "content-length": String(MAX_EVENT_PAYLOAD_BYTES + 500) },
+  );
+  const response = await ingest(req, mockCapture as any);
+
+  assert.equal(response.status, 204);
+  assert.equal(forwarded, false, "payload with oversized content-length header must not be forwarded");
+});
+
+test("ingest drops oversized multibyte UTF-8 payloads exceeding byte limit", async () => {
+  let forwarded = false;
+  const mockCapture = async () => {
+    forwarded = true;
+    return { sent: true };
+  };
+
+  // '🔥' is 4 bytes in UTF-8. 17,000 emojis = 68,000 bytes > 65,536 bytes
+  const emojiStr = "🔥".repeat(17_000);
+  const body = JSON.stringify({
+    event: "market_viewed",
+    envelope: { source_surface: "home" },
+    properties: { test: emojiStr },
+  });
+
+  const req = createMockRequest(body);
+  const response = await ingest(req, mockCapture as any);
+
+  assert.equal(response.status, 204);
+  assert.equal(forwarded, false, "oversized UTF-8 multibyte body must not be forwarded");
+});
+
+test("ingest trims properties to bounds before forwarding to capture", async () => {
+  let capturedArgs: any = null;
+  const mockCapture = async (args: any) => {
+    capturedArgs = args;
+    return { sent: true };
+  };
+
+  // Construct properties with:
+  // - string longer than 200 chars
+  // - more than 64 keys
+  // - nesting deeper than 5 levels
+  const properties: Record<string, unknown> = {
+    long_string: "s".repeat(350),
+  };
+  for (let i = 0; i < 80; i++) {
+    properties[`extra_${i}`] = i;
+  }
+  let deep: Record<string, unknown> = { leaf: "val" };
+  for (let i = 0; i < 8; i++) {
+    deep = { [`nest_${i}`]: deep };
+  }
+  properties.deep = deep;
+
+  const req = createMockRequest({
+    event: "create_submitted",
+    envelope: { source_surface: "vs_create" },
+    properties,
+  });
+
+  const response = await ingest(req, mockCapture as any);
+
+  assert.equal(response.status, 204);
+  assert.ok(capturedArgs !== null, "event must be forwarded");
+  assert.equal(capturedArgs.event, "create_submitted");
+  assert.equal(capturedArgs.envelope.source_surface, "vs_create");
+
+  // Properties must be trimmed:
+  const forwardedProps = capturedArgs.properties;
+  assert.ok(Object.keys(forwardedProps).length <= MAX_PROPERTIES);
+  assert.equal((forwardedProps.long_string as string).length, MAX_STRING_LENGTH);
+});
+
+test("ingest forwards normal events with properties unchanged", async () => {
+  let capturedArgs: any = null;
+  const mockCapture = async (args: any) => {
+    capturedArgs = args;
+    return { sent: true };
+  };
+
+  const normalProps = {
+    stake_bucket: "2-5",
+    is_rematch: false,
+  };
+
+  const req = createMockRequest({
+    event: "create_submitted",
+    envelope: { source_surface: "vs_create" },
+    properties: normalProps,
+    address: ADDRESS,
+    idempotencyKey: "test-idempotency-key",
+  });
+
+  const response = await ingest(req, mockCapture as any);
+
+  assert.equal(response.status, 204);
+  assert.ok(capturedArgs !== null, "normal event must be forwarded");
+  assert.equal(capturedArgs.event, "create_submitted");
+  assert.equal(capturedArgs.envelope.source_surface, "vs_create");
+  assert.equal(capturedArgs.envelope.actor_type, "human");
+  assert.deepEqual(capturedArgs.properties, normalProps);
+  assert.equal(capturedArgs.address, ADDRESS);
+  assert.equal(capturedArgs.idempotencyKey, "test-idempotency-key");
+});
+
+test("ingest drops malformed JSON payloads silently", async () => {
+  let forwarded = false;
+  const mockCapture = async () => {
+    forwarded = true;
+    return { sent: true };
+  };
+
+  const req = createMockRequest("{ this is not valid json");
+  const response = await ingest(req, mockCapture as any);
+
+  assert.equal(response.status, 204);
+  assert.equal(forwarded, false);
+});
+
+test("ingest drops payloads with unknown event names without forwarding", async () => {
+  let forwarded = false;
+  const mockCapture = async () => {
+    forwarded = true;
+    return { sent: true };
+  };
+
+  const req = createMockRequest({
+    event: "invalid_unregistered_event_name",
+    envelope: { source_surface: "home" },
+  });
+  const response = await ingest(req, mockCapture as any);
+
+  assert.equal(response.status, 204);
+  assert.equal(forwarded, false);
+});
+
+test("ingest drops payloads missing source_surface without forwarding", async () => {
+  let forwarded = false;
+  const mockCapture = async () => {
+    forwarded = true;
+    return { sent: true };
+  };
+
+  const req = createMockRequest({
+    event: "market_viewed",
+    envelope: {},
+  });
+  const response = await ingest(req, mockCapture as any);
+
+  assert.equal(response.status, 204);
+  assert.equal(forwarded, false);
+});
+
+test("ingest respects DNT and Sec-GPC opt-out headers", async () => {
+  let forwarded = false;
+  const mockCapture = async () => {
+    forwarded = true;
+    return { sent: true };
+  };
+
+  const optOutHeaders: Record<string, string>[] = [{ dnt: "1" }, { "sec-gpc": "1" }];
+  for (const optOutHeader of optOutHeaders) {
+    forwarded = false;
+    const req = createMockRequest(
+      { event: "market_viewed", envelope: { source_surface: "home" } },
+      optOutHeader,
+    );
+    const response = await ingest(req, mockCapture as any);
+    assert.equal(response.status, 204);
+    assert.equal(forwarded, false, `opt-out via ${JSON.stringify(optOutHeader)} must drop without forwarding`);
+  }
+});
+
+test("POST route handler successfully processes requests end-to-end", async () => {
+  const req = createMockRequest({
+    event: "market_viewed",
+    envelope: { source_surface: "explorer" },
+    properties: { unsupported_mode: false },
+  });
+  const response = await POST(req as any);
+  assert.equal(response.status, 204);
+});
+
