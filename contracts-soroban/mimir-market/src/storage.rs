@@ -5,18 +5,37 @@
 
 use soroban_sdk::{contracttype, Address, Env, Vec};
 
-use crate::types::{Challenger, Claim, Error, FeePolicy, PendingFeePolicy, Verdict};
+use crate::types::{
+    Challenger, ChallengerPage, Claim, Error, FeePolicy, PendingFeePolicy, PendingOracle,
+    RematchStatus, Verdict,
+};
+
+/// Maximum number of addresses accepted by [`get_withdrawable_batch`].
+///
+/// Keeps the ledger-entry footprint of a single read bounded.
+pub const MAX_BATCH_SIZE: u32 = 50;
+
+/// Number of claim ids packed into a single per-creator index page.
+///
+/// Keeps each persistent entry small while amortising the per-entry overhead.
+pub const CREATOR_PAGE_SIZE: u32 = 100;
 
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
     /// One-time initialisation guard.
     Init,
+    /// Global pause flag. When set, state-changing market operations are
+    /// halted, but withdrawals and fee pulls MUST remain available so user
+    /// funds are never trapped by an operator pause.
+    Paused,
     Owner,
     Oracle,
     Usdc,
     Policy,
     Pending,
+    /// Queued oracle rotation (separate from fee-policy Pending).
+    PendingOracle,
     ClaimCount,
     TotalResolved,
     FeesAccrued,
@@ -31,6 +50,12 @@ pub enum DataKey {
     Withdrawable(Address),
     /// Accrued, unclaimed fees. Always pulled, never pushed.
     Accrued(Address),
+    /// Rematch parent link validation cache: (parent_id, child_id) -> RematchStatus
+    RematchParent(u64, u64),
+    /// Per-creator claim index page: (creator, page_index) -> Vec<u64> of claim ids.
+    CreatorClaims(Address, u32),
+    /// Per-creator total claim count, used to derive the page layout.
+    CreatorClaimCount(Address),
 }
 
 /// Persistent entries are bumped to roughly 30 days of ledgers on touch so an
@@ -46,6 +71,22 @@ pub fn is_initialized(env: &Env) -> bool {
 
 pub fn mark_initialized(env: &Env) {
     env.storage().instance().set(&DataKey::Init, &true);
+}
+
+/// Whether the market is currently paused.
+///
+/// Pause is a *state-changing* gate only: it must never be consulted on the
+/// withdrawal or fee-pull paths. See [`require_not_paused`] for the guard used
+/// by mutating entry points.
+pub fn is_paused(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::Paused)
+        .unwrap_or(false)
+}
+
+pub fn set_paused(env: &Env, paused: bool) {
+    env.storage().instance().set(&DataKey::Paused, &paused);
 }
 
 pub fn owner(env: &Env) -> Result<Address, Error> {
@@ -102,6 +143,18 @@ pub fn set_pending_fee_policy(env: &Env, pending: &PendingFeePolicy) {
 
 pub fn clear_pending_fee_policy(env: &Env) {
     env.storage().instance().remove(&DataKey::Pending);
+}
+
+pub fn pending_oracle(env: &Env) -> Option<PendingOracle> {
+    env.storage().instance().get(&DataKey::PendingOracle)
+}
+
+pub fn set_pending_oracle(env: &Env, pending: &PendingOracle) {
+    env.storage().instance().set(&DataKey::PendingOracle, pending);
+}
+
+pub fn clear_pending_oracle(env: &Env) {
+    env.storage().instance().remove(&DataKey::PendingOracle);
 }
 
 fn counter(env: &Env, key: DataKey) -> u64 {
@@ -166,6 +219,27 @@ pub fn get_claim(env: &Env, id: u64) -> Result<Claim, Error> {
     Ok(claim)
 }
 
+/// Return `Some(claim)` if the entry exists, `None` if it does not.
+///
+/// Unlike [`get_claim`], a miss does NOT bump the TTL (there is nothing to
+/// extend) and does NOT return an error, so it is the right primitive for
+/// batch reads where a missing id is a normal, non-fatal answer.
+///
+/// A present entry still receives its usual TTL extension so an open market
+/// cannot expire while a batch is being constructed.
+pub fn get_claim_opt(env: &Env, id: u64) -> Option<Claim> {
+    let key = DataKey::Claim(id);
+    match env.storage().persistent().get::<_, Claim>(&key) {
+        Some(claim) => {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, BUMP_THRESHOLD, BUMP_EXTEND);
+            Some(claim)
+        }
+        None => None,
+    }
+}
+
 pub fn set_claim(env: &Env, id: u64, claim: &Claim) {
     let key = DataKey::Claim(id);
     env.storage().persistent().set(&key, claim);
@@ -194,22 +268,11 @@ pub fn challengers(env: &Env, id: u64) -> Vec<Challenger> {
 ///
 /// Never panics: if `offset` is beyond the end of the roster the returned
 /// `items` slice is empty and `total` carries the actual roster length.
-pub fn challengers_page(
-    env: &Env,
-    id: u64,
-    offset: u32,
-    limit: u32,
-) -> crate::types::ChallengerPage {
+pub fn challengers_page(env: &Env, id: u64, offset: u32, limit: u32) -> ChallengerPage {
     let list = challengers(env, id);
     let total = list.len();
-
-    // Clamp offset to [0, total] so arithmetic below is always valid.
     let start = offset.min(total);
-
-    // How many items remain from `start` to the end of the roster.
     let remaining = total - start;
-
-    // Effective limit: 0 means "everything remaining".
     let take = if limit == 0 {
         remaining
     } else {
@@ -221,7 +284,7 @@ pub fn challengers_page(
         items.push_back(list.get(i).unwrap());
     }
 
-    crate::types::ChallengerPage {
+    ChallengerPage {
         items,
         offset: start,
         total,
@@ -234,6 +297,112 @@ pub fn set_challengers(env: &Env, id: u64, list: &Vec<Challenger>) {
     env.storage()
         .persistent()
         .extend_ttl(&key, BUMP_THRESHOLD, BUMP_EXTEND);
+}
+
+// ── Per-creator claim index ──────────────────────────────────────────────────
+
+/// Total number of claims ever created by `creator`.
+///
+/// This is the authoritative length of the creator's index; pages are derived
+/// from it on read, so a partially-written tail page is never observed.
+pub fn creator_claim_count(env: &Env, creator: &Address) -> u64 {
+    let key = DataKey::CreatorClaimCount(creator.clone());
+    match env.storage().persistent().get::<_, u64>(&key) {
+        Some(count) => {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, BUMP_THRESHOLD, BUMP_EXTEND);
+            count
+        }
+        None => 0,
+    }
+}
+
+fn creator_page(env: &Env, creator: &Address, page: u32) -> Vec<u64> {
+    let key = DataKey::CreatorClaims(creator.clone(), page);
+    match env.storage().persistent().get::<_, Vec<u64>>(&key) {
+        Some(list) => {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, BUMP_THRESHOLD, BUMP_EXTEND);
+            list
+        }
+        None => Vec::new(env),
+    }
+}
+
+fn set_creator_page(env: &Env, creator: &Address, page: u32, list: &Vec<u64>) {
+    let key = DataKey::CreatorClaims(creator.clone(), page);
+    env.storage().persistent().set(&key, list);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, BUMP_THRESHOLD, BUMP_EXTEND);
+}
+
+/// Append `id` to the creator's index, writing at most one page entry.
+///
+/// The page is only rewritten when the current tail page is full and a new
+/// page must be started; otherwise the existing tail page is read, extended,
+/// and written back, so `create_claim` grows its footprint by at most one
+/// persistent entry.
+pub fn append_creator_claim(env: &Env, creator: &Address, id: u64) {
+    let count = creator_claim_count(env, creator);
+    let page = (count / CREATOR_PAGE_SIZE as u64) as u32;
+    let mut list = creator_page(env, creator, page);
+    list.push_back(id);
+    set_creator_page(env, creator, page, &list);
+
+    let count_key = DataKey::CreatorClaimCount(creator.clone());
+    env.storage().persistent().set(&count_key, &(count + 1));
+    env.storage()
+        .persistent()
+        .extend_ttl(&count_key, BUMP_THRESHOLD, BUMP_EXTEND);
+}
+
+/// Return a page of claim ids created by `creator`, starting at `offset`, up to
+/// `limit` entries, along with the creator's total claim count.
+///
+/// `limit = 0` is treated as "return all remaining entries from `offset`".
+/// Never panics: an `offset` beyond the end yields an empty slice and the
+/// actual total.
+pub fn get_creator_claims(
+    env: &Env,
+    creator: &Address,
+    offset: u32,
+    limit: u32,
+) -> (Vec<u64>, u64) {
+    let total = creator_claim_count(env, creator);
+    let start = (offset as u64).min(total);
+    let remaining = total - start;
+    let take = if limit == 0 {
+        remaining
+    } else {
+        (limit as u64).min(remaining)
+    };
+
+    let mut out = Vec::new(env);
+    let mut cursor = start;
+    let end = start + take;
+    while cursor < end {
+        let page = (cursor / CREATOR_PAGE_SIZE as u64) as u32;
+        let page_start = (page as u64) * CREATOR_PAGE_SIZE as u64;
+        let list = creator_page(env, creator, page);
+        let local = (cursor - page_start) as u32;
+        let page_len = list.len();
+        let mut i = local;
+        while i < page_len && cursor < end {
+            out.push_back(list.get(i).unwrap());
+            i += 1;
+            cursor += 1;
+        }
+        if i >= page_len {
+            // Guard against a short/missing page: advance to the next page
+            // boundary so the loop always terminates.
+            cursor = page_start + CREATOR_PAGE_SIZE as u64;
+        }
+    }
+
+    (out, total)
 }
 
 // ── Versioned verdicts ───────────────────────────────────────────────────────
@@ -293,6 +462,38 @@ pub fn clear_withdrawable(env: &Env, who: &Address) {
     set_address_i128(env, DataKey::Withdrawable(who.clone()), 0);
 }
 
+/// Read the withdrawable balance without any pause check.
+///
+/// Withdrawals are a user-funds escape hatch and MUST remain readable and
+/// payable while the market is paused. This accessor exists so callers can
+/// make that intent explicit and so a future refactor of [`withdrawable`]
+/// cannot accidentally reintroduce a pause gate on the read path.
+pub fn withdrawable_unpaused(env: &Env, who: &Address) -> i128 {
+    withdrawable(env, who)
+}
+
+/// Batched read of withdrawable balances keyed by an address list.
+///
+/// Returns one entry per input address, in the same order as `addrs`.
+/// Addresses with no parked balance (or never seen) return `0`.
+///
+/// Rejects inputs longer than [`MAX_BATCH_SIZE`] with [`Error::BatchTooLarge`]
+/// *before* touching storage, so an over-sized call costs no ledger reads.
+///
+/// Sits next to `get_claims_batch` as the operator-facing batch primitive for
+/// finding parked payouts without replaying `WithdrawalPending` events.
+pub fn get_withdrawable_batch(env: &Env, addrs: Vec<Address>) -> Result<Vec<i128>, Error> {
+    if addrs.len() > MAX_BATCH_SIZE {
+        return Err(Error::BatchTooLarge);
+    }
+
+    let mut out = Vec::new(env);
+    for who in addrs.iter() {
+        out.push_back(withdrawable(env, &who));
+    }
+    Ok(out)
+}
+
 pub fn accrued_fees(env: &Env, who: &Address) -> i128 {
     address_i128(env, DataKey::Accrued(who.clone()))
 }
@@ -305,4 +506,41 @@ pub fn add_accrued_fees(env: &Env, who: &Address, delta: i128) {
 
 pub fn clear_accrued_fees(env: &Env, who: &Address) {
     set_address_i128(env, DataKey::Accrued(who.clone()), 0);
+}
+
+/// Read accrued, unclaimed fees without any pause check.
+///
+/// Fee pulls are always pull-based and MUST remain available while paused so
+/// accrued protocol/beneficiary funds are never frozen by an operator pause.
+pub fn accrued_fees_unpaused(env: &Env, who: &Address) -> i128 {
+    accrued_fees(env, who)
+}
+
+// ── Rematch Parent Link Validation ───────────────────────────────────────────
+
+pub fn get_rematch_parent_status(
+    env: &Env,
+    parent_id: u64,
+    child_id: u64,
+) -> Option<RematchStatus> {
+    let key = DataKey::RematchParent(parent_id, child_id);
+    env.storage().persistent().get(&key)
+}
+
+pub fn set_rematch_parent_status(
+    env: &Env,
+    parent_id: u64,
+    child_id: u64,
+    status: &RematchStatus,
+) {
+    let key = DataKey::RematchParent(parent_id, child_id);
+    env.storage().persistent().set(&key, status);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, BUMP_THRESHOLD, BUMP_EXTEND);
+}
+
+pub fn clear_rematch_parent_status(env: &Env, parent_id: u64, child_id: u64) {
+    let key = DataKey::RematchParent(parent_id, child_id);
+    env.storage().persistent().remove(&key);
 }
