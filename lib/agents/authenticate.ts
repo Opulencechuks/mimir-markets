@@ -41,7 +41,7 @@ export function requiresOwnerSignature(action: AgentApiAction): boolean {
 }
 
 export type AgentAuth =
-  | { kind: "api_key"; agentId: string; keyId: string }
+  | { kind: "api_key"; agentId: string; keyId: string; scopes?: readonly string[] }
   | { kind: "signature" };
 
 export interface AuthenticateResult {
@@ -68,7 +68,7 @@ export async function authenticateAgentRequest(args: {
 
   if (!presented) {
     // No key: the caller must be signing. Still rate-limited, by IP and route.
-    const gate = authorizeRequest("public_read", { route, ip: args.ip });
+    const gate = await authorizeRequest("public_read", { route, ip: args.ip });
     if (!gate.allowed && gate.error) return { error: gate.error };
     return { auth: { kind: "signature" } };
   }
@@ -94,6 +94,10 @@ export async function authenticateAgentRequest(args: {
     return { error: apiError("forbidden", "key does not belong to this agent") };
   }
 
+  if (checked.record.scopes && !checked.record.scopes.includes(args.action)) {
+    return { error: apiError("forbidden", `API key is not scoped for action: ${args.action}`) };
+  }
+
   if (requiresOwnerSignature(args.action)) {
     return {
       error: apiError(
@@ -103,7 +107,7 @@ export async function authenticateAgentRequest(args: {
     };
   }
 
-  const gate = authorizeRequest("api_key_agent", {
+  const gate = await authorizeRequest("api_key_agent", {
     route, ip: args.ip, agentId: checked.record.agentId,
   });
   if (!gate.allowed && gate.error) return { error: gate.error };
@@ -112,5 +116,5 @@ export async function authenticateAgentRequest(args: {
   // request that was otherwise authorised.
   void touchAgentApiKey(checked.record.keyId, Date.now()).catch(() => undefined);
 
-  return { auth: { kind: "api_key", agentId: checked.record.agentId, keyId: checked.record.keyId } };
+  return { auth: { kind: "api_key", agentId: checked.record.agentId, keyId: checked.record.keyId, scopes: checked.record.scopes } };
 }

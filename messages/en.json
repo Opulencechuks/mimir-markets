@@ -1,4 +1,10 @@
 {
+  "liveDeadline": {
+    "phaseOpen": "OPEN",
+    "phaseLocked": "LOCKED",
+    "phaseVerifying": "VERIFYING",
+    "phaseSettled": "SETTLED"
+  },
   "metadata": {
     "title": "Mimir Markets",
     "description": "1v1 prediction challenges settled by AI. No referees. No arguments. Mimir decides."
@@ -318,6 +324,15 @@
     "settlementRuleHint": "Add custom judging instructions when the market needs more than the raw question text.",
     "questionStrengthHint": "Name the outcome, the subject, and the exact window you want Mimir to judge.",
     "sourceStrengthHint": "Use a source page that will still show the exact result when the deadline arrives.",
+    "resolutionSourceTypeLabel": "Source class (optional)",
+    "resolutionSourceTypeNone": "Choose a source class",
+    "resolutionSourceTypeOfficial": "Official publisher",
+    "resolutionSourceTypeMedia": "Independent media",
+    "resolutionSourceTypeOther": "Other source",
+    "resolutionSourceTargetLabel": "Exact result to read (optional)",
+    "resolutionSourceTargetPlaceholder": "For example, the final score shown on the official match page",
+    "resolutionSourceMetadataHint": "Optional creator-provided metadata is added to the on-chain settlement rule. It is not independently verified; the source URL remains the primary resolution reference.",
+    "resolutionSourceCanonicalUrl": "Canonical URL stored on-chain",
     "settlementStrengthHint": "The clearer your settlement rule is, the easier the claim is to resolve consistently.",
     "marketTypes": {
       "binary": "Binary",
@@ -653,6 +668,8 @@
     "receiptOutcomeNone": "No outcome recorded",
     "receiptValueUnavailable": "—",
     "receiptChainNote": "Amounts and outcome come from the on-chain claim record. Challenger payouts stay pull-based after settlement.",
+    "receiptCitations": "Research Citations",
+    "receiptEvidenceHash": "Evidence Hash",
     "receiptStatus": {
       "loading": "Loading",
       "invalid": "Not settled",
@@ -1065,7 +1082,11 @@
     "claimPayoutError": "Could not collect the payout.",
     "claimPayoutRejected": "Payout signature rejected in your wallet.",
     "claimPayoutCollected": "Payout collected.",
-    "claimPayoutChecking": "Checking your payout..."
+    "claimPayoutChecking": "Checking your payout...",
+    "parkedPayoutTitle": "Parked payout",
+    "parkedPayoutHint": "Your payout could not be delivered — the USDC trustline refused the transfer (it is frozen or deauthorized) — so the contract parked it for you instead of keeping your money. Nothing expires: withdraw it once your trustline can receive USDC.",
+    "parkedWithdrawError": "Could not withdraw the parked payout.",
+    "parkedWithdrawRejected": "Withdrawal signature rejected in your wallet."
   },
   "wallet": {
     "noWallet": "No Stellar wallet found. Install Freighter, xBull, Lobstr or Hana.",
@@ -1099,6 +1120,18 @@
     "trustlineAdd": "Add USDC trustline",
     "trustlineAdding": "Confirm in wallet...",
     "trustlineRejected": "Trustline signature rejected in your wallet."
+  },
+  "fees": {
+    "loadFailed": "Could not read the fee schedule from the network.",
+    "agentWhatYouEarn": "What you earn",
+    "agentDescription1": "When somebody else profits through your agent you take <strong>{agent}%</strong> of their profit, and the protocol takes <strong>{platform}%</strong>. Fees are charged on profit only, never on the stake - so a winner never receives less than they put in, and a loser is charged nothing.",
+    "agentDescription2": "Using your own agent costs you no agent fee. You would only be paying yourself.",
+    "basketWhatYouEarn": "What you earn",
+    "basketDescription1": "When somebody profits by following your basket you take <strong>{basket}%</strong> of their profit. The agents' owners keep their <strong>{agent}%</strong> and the protocol takes <strong>{platform}%</strong> - all charged on profit only.",
+    "basketDescription2": "Following your own basket costs you no basket fee.",
+    "followDescription": "On profit: {platform}% protocol, {agent}% to the agents' owners, {basketPart}. Losses are never charged.",
+    "followBasketIsOwn": "and no basket fee — this basket is yours",
+    "followBasketCreator": "{basket}% to whoever composed it"
   },
   "categories": {
     "sports": "Sports",
@@ -1147,6 +1180,24 @@
     "installationsLimitGuide": "Your inbox hit the device installation limit. Open XMTP’s inbox tools, revoke installs you no longer need, then tap Retry below.",
     "openInboxTools": "Open inbox tools",
     "retry": "Retry",
+    "retrying": "Retrying…",
+    "failureEyebrow": "Messaging problem",
+    "failureEscalated": "Still failing after several attempts. Close other Mimir tabs, check your connection, then retry.",
+    "failureNotRetryable": "Retrying will not help here — this needs a different wallet or a change outside Mimir.",
+    "failureTechnicalDetails": "Technical details (for support)",
+    "failureSignatureDeclined": "You declined the signature that creates your messaging key, so chat can't start. Approve it once and chat will open.",
+    "failureUnsupportedWallet": "This wallet can't sign messages, which chat needs to create your messaging key. Connect a wallet that supports signing and retry.",
+    "failureInvalidIdentity": "Your messaging key came out malformed, so chat can't start. Disconnect and reconnect your wallet to rebuild it.",
+    "failureInstallationsLimit": "Your inbox reached XMTP's device installation limit. Revoke installs you no longer need, then retry.",
+    "failureBlockedByTab": "Chat is open in another Mimir tab. Close that tab, or tap Retry to take over here.",
+    "failureNetwork": "Network issue reaching XMTP. Check your connection and retry.",
+    "failureTimeout": "XMTP took too long to answer. Retry, or close other Mimir tabs and try again.",
+    "failureStreamLost": "The live connection to this chat dropped.",
+    "failureSendFailed": "This message didn't send.",
+    "streamLostEyebrow": "Live updates paused",
+    "streamLostStaleHint": "Messages already loaded are still here, but new ones may not appear until the chat reconnects.",
+    "sendFailedEyebrow": "Message not sent",
+    "sendFailedDraftKept": "Your text is back in the box — press Send to try again.",
     "emptyThread": "No messages yet. Say hello.",
     "emptyThreadHint": "Only you and your rival can read this thread.",
     "messageFromYou": "You",
@@ -1156,10 +1207,7 @@
     "sendingMessage": "Sending…",
     "messageQueued": "Delivering…",
     "disclaimer": "Messages are delivered over XMTP (E2E encrypted). They are not stored on Mimir servers.",
-    "blockedByTabTitle": "Chat open in another tab",
-    "blockedByTabDesc": "Close the other tab to use chat here. It will reconnect automatically.",
     "chatPreviewEyebrow": "Layout preview",
-    "chatPreviewBanner": "Your rival hasn't joined XMTP yet. Once they sign in to Mimir (or any XMTP app) with their wallet, tap Retry.",
     "chatPreviewAriaLabel": "Demo conversation layout",
     "chatPreviewSrHint": "Sample messages between rival {peer} and you {you}.",
     "chatPreviewBubblePeer": "Hey — we good to settle on the linked source at deadline?",
@@ -1167,6 +1215,13 @@
     "chatPreviewBubblePeerShort": "👍",
     "chatPreviewInputPlaceholder": "Unavailable until the thread opens",
     "chatPreviewFootnote": "Sample layout only — nothing is sent over XMTP until the rival is reachable."
+  },
+  "agentDirectory": {
+    "emptyStateTitle": "No agents found",
+    "emptyStateDescription": "No agents are configured in this deploy. Start by creating the first agent.",
+    "errorTitle": "Could not load agents",
+    "errorDescription": "There was a problem reading the directory. This might be a temporary dependency failure or a network issue.",
+    "createAction": "Create an agent"
   },
   "messagesHub": {
     "eyebrow": "End-to-end encrypted · XMTP",
@@ -1215,7 +1270,17 @@
   "emergingNarratives": {
     "title": "EMERGING NARRATIVES",
     "lead": "Opportunities to generate new challenges from emerging signals and storylines.",
-    "comingSoon": "COMMING SOON"
+    "rank": "Rank {rank}",
+    "momentum": "Momentum",
+    "newMarkets": "New markets · recent / previous",
+    "newStake": "New stake · recent / previous (USDC)",
+    "windowLabels": "Recent 7 days / previous 7 days",
+    "marketStake": "Stake: {amount} USDC",
+    "viewCategory": "View {category} markets",
+    "emptyTitle": "No emerging activity yet",
+    "emptyDescription": "New markets and stake activity will appear here as categories gain momentum.",
+    "errorTitle": "Narratives could not be loaded",
+    "errorDescription": "The market index is temporarily unavailable. Refresh the page to try again."
   },
   "reasoningFeed": {
     "title": "Agent reasoning",
@@ -1278,5 +1343,42 @@
       "cancelled": "Cancelled",
       "dependency_failure": "Bad hash"
     }
+  },
+  "contract": {
+    "already_challenged": "A challenger has already entered this challenge. Join the existing challenge instead.",
+    "already_claimed_payout": "This challenger already collected their settlement.",
+    "chain_unavailable": "The contract is temporarily unavailable. Refresh and try again.",
+    "challenge_window_closed": "The challenge window is closed. This claim is no longer accepting challenges.",
+    "challengers_did_not_win": "The challenger side did not win this claim, so this payout was not awarded. Check the final outcome before collecting.",
+    "claim_full": "This market has reached the maximum number of challengers. Choose another one or wait for a slot to open.",
+    "claim_not_active": "This challenge is no longer active for new stakes. Review the current state first.",
+    "claim_not_found": "We could not read that challenge. Check the link or load the market again.",
+    "claim_not_open": "This challenge is closed to new stakes. Review the current state before acting.",
+    "claim_not_resolved": "That action only works after the market has been resolved.",
+    "deadline_in_past": "The deadline is in the past. Use a future deadline so the marketplace can accept the entry.",
+    "duel_needs_equal_stake": "A duel needs a stake that exactly matches the creator's. Adjust your stake and try again.",
+    "empty_question": "Every challenge needs a question. Write the outcome you want to settle, then try again.",
+    "fee_cap_exceeded": "Fee policy changes are capped at the configured limit. Reduce the total fee and try again.",
+    "fee_needs_recipient": "A fee recipient must be set before this policy can be queued.",
+    "fee_policy_not_ready": "The queued fee policy is not ready yet. Wait for the stated window to open.",
+    "insufficient_creation_liquidity": "This creator liquidity is not sufficient for the amount you offered. Reduce your stake or choose a market with more attached capacity.",
+    "invalid_invite_key": "That invite link is not valid. Ask the creator for the current invite link.",
+    "invalid_request": "This request cannot be completed as written. Check the input and try again.",
+    "invalid_verdict": "The verdict you tried to record is not valid. Confirm the winner side and try again.",
+    "invite_key_too_long": "That invite key is too long. Use a shorter invite link.",
+    "no_fees": "There are no accrued fees to claim right now.",
+    "not_a_challenger": "You are not listed as a challenger on this claim, so you cannot pull this payout.",
+    "not_creator": "Only the creator of this challenge can perform that action.",
+    "not_yet_expired": "This deadline has not ended yet, so that action cannot be taken now.",
+    "nothing_queued": "There is no fee policy waiting to be applied.",
+    "nothing_to_withdraw": "There is nothing parked for you yet. Withdrawals from funded markets stay open.",
+    "overflow": "The requested action would exceed what the contract can hold. Reduce the amount and try again.",
+    "payout_exceeds_escrow": "The payout that was attempted is larger than the money held by the market. This is a contract state issue; try again with a smaller amount.",
+    "self_challenge": "You cannot challenge your own claim. Open a challenge against another claim.",
+    "stake_too_small": "Your stake is below the minimum. Enter at least the configured minimum stake for this market.",
+    "timelocked": "This fee policy is still inside its approved time window. Try again after it opens.",
+    "unsupported_decimals": "This market requires the expected token scale. Please use the configured asset so your amount is read correctly.",
+    "unsupported_token": "The token this market is configured for cannot be accepted. This market only supports the configured asset. Choose another market.",
+    "zero_stake": "Stake must be greater than zero."
   }
 }

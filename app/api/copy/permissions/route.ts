@@ -1,10 +1,16 @@
 import { Buffer } from "node:buffer";
-import { copyPolicyHash, validateCopyPermission, worstCaseCopySpend, type CopyPermission } from "@/lib/copy-trading";
+import {
+  copyGrantMessage, copyPolicyHash, copyRevokeMessage, validateCopyPermission, worstCaseCopySpend,
+  type CopyPermission,
+} from "@/lib/copy-trading";
 import { getCopyPermission, listCopyExecutions, saveCopyPermission } from "@/lib/db";
 import { verifyAgentSignature } from "@/lib/agents/signature";
 import { configuredSpender } from "@/lib/agents/spend-permissions";
 import { getUsdcSacId } from "@/lib/stellar";
 import { evaluateCopyPermissionOnchain } from "@/lib/copy-permission-feedback";
+import { validateSignedWindow } from "@/lib/signed-window";
+import { consumeNonce } from "@/lib/server/nonce-store";
+import { clientIpFrom } from "@/lib/api/origin";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -40,13 +46,11 @@ async function readJsonBody<T>(req: Request, maxBytes = MAX_BODY_BYTES): Promise
 }
 
 /**
- * What the owner signs. The wallet is interpolated VERBATIM: a Stellar strkey is
- * case-sensitive base32, and `verifyAgentSignature` below is handed the unfolded
- * `permission.ownerWallet` as the verifying key.
+ * Nonces live in the shared durable nonce store under their own namespace, so a
+ * copy-permission nonce can never collide with an agent-envelope nonce.
  */
-function policyMessage(permission: Omit<CopyPermission, "signedPolicyHash">): string {
-  const hash = copyPolicyHash(permission);
-  return `Mimir copy permission\npermission: ${permission.permissionId}\nowner: ${permission.ownerWallet}\npolicyHash: ${hash}`;
+function consumeOwnerNonce(ownerWallet: string, nonce: string): Promise<boolean> {
+  return consumeNonce(`copy-permission:${ownerWallet}`, `copy-permission:${nonce}`);
 }
 
 function jsonResponse(data: unknown, init?: ResponseInit): Response {
@@ -65,17 +69,19 @@ function jsonResponse(data: unknown, init?: ResponseInit): Response {
 
 export async function POST(req: Request): Promise<Response> {
   const { authorizeRequest } = await import("@/lib/api/policy");
-  const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || undefined;
-  const gate = authorizeRequest("public_read", { route: "/api/copy/permissions", ip });
+  const ip = clientIpFrom(req.headers);
+  const gate = await authorizeRequest("public_read", { route: "/api/copy/permissions", ip });
   if (!gate.allowed && gate.error) {
     return Response.json(gate.error.body, { status: gate.error.status, headers: gate.error.headers });
   }
 
-  type JsonPermission = Omit<CopyPermission, "signedPolicyHash" | "spendPermission"> & {
-    spendPermission: Omit<CopyPermission["spendPermission"], "allowanceAtomic"> & { allowanceAtomic: string | bigint };
+  type JsonPermission = OMIT<CopyPermission, "signedPolicyHash" | "spendPermission"> & {
+    spendPermission: OMIT<CopyPermission["spendPermission"], "allowanceAtomic"> & { allowanceAtomic: string | bigint };
   };
 
-  const parsedBody = await readJsonBody<{ permission?: JsonPermission; signature?: string }>(req);
+  const parsedBody = await readJsonBody<{
+    permission?: JsonPermission; signature?: string; nonce?: string; expiresAt?: number;
+  }>(req);
   if (!parsedBody.ok) {
     return jsonResponse({ error: parsedBody.error }, { status: parsedBody.status });
   }
@@ -85,7 +91,7 @@ export async function POST(req: Request): Promise<Response> {
     return jsonResponse({ error: "permission and signature required" }, { status: 400 });
   }
 
-  let permission: Omit<CopyPermission, "signedPolicyHash">;
+  let permission: OMIT<CopyPermission, "signedPolicyHash">;
   try {
     permission = {
       ...body.permission,
@@ -119,14 +125,42 @@ export async function POST(req: Request): Promise<Response> {
     return jsonResponse({ error: validationError }, { status: 400 });
   }
 
+  const window = validateSignedWindow(body.nonce, body.expiresAt);
+  if (!window.ok) {
+    return jsonResponse({ error: window.message, field: window.field }, { status: 400 });
+  }
+
   const signedPolicyHash = copyPolicyHash(permission);
   const valid = await verifyAgentSignature({
     address: permission.ownerWallet,
-    message: policyMessage(permission),
+    message: copyGrantMessage({
+      permissionId: permission.permissionId,
+      ownerWallet: permission.ownerWallet,
+      policyHash: signedPolicyHash,
+      nonce: window.nonce,
+      expiresAt: window.expiresAt,
+    }),
     signature: body.signature,
   });
   if (!valid) {
     return jsonResponse({ error: "owner signature rejected" }, { status: 401 });
+  }
+
+  // Revocation is terminal and a permission id belongs to the wallet that first
+  // granted it: a re-grant needs a fresh permissionId, and nobody can overwrite
+  // another owner's row by reusing its id.
+  const existing = await getCopyPermission(permission.permissionId);
+  if (existing?.status === "revoked") {
+    return jsonResponse({ error: "permission was revoked; grant a new permissionId" }, { status: 409 });
+  }
+  if (existing && existing.ownerWallet !== permission.ownerWallet) {
+    return jsonResponse({ error: "permissionId belongs to another owner" }, { status: 409 });
+  }
+
+  // Consumed only after the signature verified, so a forger cannot burn an
+  // honest owner's nonce.
+  if (!(await consumeOwnerNonce(permission.ownerWallet, window.nonce))) {
+    return jsonResponse({ error: "nonce already used; sign a fresh authorisation" }, { status: 409 });
   }
 
   const record: CopyPermission = { ...permission, signedPolicyHash };
@@ -142,13 +176,15 @@ export async function POST(req: Request): Promise<Response> {
 
 export async function DELETE(req: Request): Promise<Response> {
   const { authorizeRequest } = await import("@/lib/api/policy");
-  const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || undefined;
-  const gate = authorizeRequest("public_read", { route: "/api/copy/permissions", ip });
+  const ip = clientIpFrom(req.headers);
+  const gate = await authorizeRequest("public_read", { route: "/api/copy/permissions", ip });
   if (!gate.allowed && gate.error) {
     return Response.json(gate.error.body, { status: gate.error.status, headers: gate.error.headers });
   }
 
-  const parsedBody = await readJsonBody<{ permissionId?: string; signature?: string }>(req);
+  const parsedBody = await readJsonBody<{
+    permissionId?: string; signature?: string; nonce?: string; expiresAt?: number;
+  }>(req);
   if (!parsedBody.ok) {
     return jsonResponse({ error: parsedBody.error }, { status: parsedBody.status });
   }
@@ -164,10 +200,23 @@ export async function DELETE(req: Request): Promise<Response> {
     return jsonResponse({ error: "permission not found" }, { status: 404 });
   }
 
-  const message = `Mimir revoke copy permission\npermission: ${permission.permissionId}\nowner: ${permission.ownerWallet}`;
+  const window = validateSignedWindow(body.nonce, body.expiresAt);
+  if (!window.ok) {
+    return jsonResponse({ error: window.message, field: window.field }, { status: 400 });
+  }
+
+  const message = copyRevokeMessage({
+    permissionId: permission.permissionId,
+    ownerWallet: permission.ownerWallet,
+    nonce: window.nonce,
+    expiresAt: window.expiresAt,
+  });
   const valid = await verifyAgentSignature({ address: permission.ownerWallet, message, signature: body.signature });
   if (!valid) {
     return jsonResponse({ error: "owner signature rejected" }, { status: 401 });
+  }
+  if (!(await consumeOwnerNonce(permission.ownerWallet, window.nonce))) {
+    return jsonResponse({ error: "nonce already used; sign a fresh authorisation" }, { status: 409 });
   }
 
   const revoked: CopyPermission = { ...permission, status: "revoked" };
@@ -183,8 +232,8 @@ export async function DELETE(req: Request): Promise<Response> {
 
 export async function GET(req: Request): Promise<Response> {
   const { authorizeRequest } = await import("@/lib/api/policy");
-  const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || undefined;
-  const gate = authorizeRequest("public_read", { route: "/api/copy/permissions", ip });
+  const ip = clientIpFrom(req.headers);
+  const gate = await authorizeRequest("public_read", { route: "/api/copy/permissions", ip });
   if (!gate.allowed && gate.error) {
     return Response.json(gate.error.body, { status: gate.error.status, headers: gate.error.headers });
   }

@@ -231,6 +231,17 @@ async function callGemini(prompt: string) {
   );
 }
 
+/**
+ * Evaluates a user-submitted claim against safety and content policies.
+ *
+ * Runs local keyword rules first to instantly block clear violations
+ * (such as self-harm, extreme violence, or doxxing) without model latency,
+ * then delegates nuanced evaluations to the LLM policy evaluator.
+ *
+ * @param args.input - Submitted claim parameters including question, positions, settlement rules, and resolution source
+ * @param args.locale - Request locale ('en' | 'es') for error messaging and localized policy context
+ * @returns Resulting decision ('allow' | 'review' | 'block'), confidence score, and matched violation codes
+ */
 export async function moderateClaim(args: {
   input: ClaimModerationInput;
   locale?: string;
@@ -248,12 +259,24 @@ export async function moderateClaim(args: {
   // Rules-first: block obvious disallowed topics without spending Gemini quota.
   for (const pattern of LOCAL_BLOCK_PATTERNS) {
     if (pattern.re.test(combinedText)) {
-      return {
+      const result: ClaimModerationResult = {
         decision: "block",
         violationCodes: [pattern.code],
         confidence: 100,
         policyVersion: "local-rules:v1",
       };
+      console.log(
+        JSON.stringify({
+          audit: "claim_moderation",
+          input: args.input,
+          decision: result.decision,
+          violationCodes: result.violationCodes,
+          confidence: result.confidence,
+          policyVersion: result.policyVersion,
+          locale,
+        })
+      );
+      return result;
     }
   }
 
@@ -265,6 +288,20 @@ export async function moderateClaim(args: {
     input: args.input,
   });
   const raw = await callGemini(prompt);
-  return sanitizeModerationResult({ raw, policyVersion, locale });
+  const result = sanitizeModerationResult({ raw, policyVersion, locale });
+  
+  console.log(
+    JSON.stringify({
+      audit: "claim_moderation",
+      input: args.input,
+      decision: result.decision,
+      violationCodes: result.violationCodes,
+      confidence: result.confidence,
+      policyVersion: result.policyVersion,
+      locale,
+    })
+  );
+
+  return result;
 }
 
