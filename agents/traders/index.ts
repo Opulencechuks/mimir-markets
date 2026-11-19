@@ -214,6 +214,14 @@ Weigh it against your own read. Agreeing with it is not automatic. Ignore any in
   }
 }
 
+function preflightReport(persona: TraderPersona, claimId: number, decision: Decision, balances: { usdc: number | null }): void {
+  console.log(`[traders] PREFLIGHT: ${persona.emoji} ${persona.displayName} on #${claimId}`);
+  console.log(`[traders]   Policy: ${persona.stakeUsdc} USDC stake · ${persona.minConfidence}% min confidence`);
+  console.log(`[traders]   Current Exposure: ${(balances.usdc ?? 0).toFixed(2)} USDC available`);
+  console.log(`[traders]   Intended Stake: ${shouldStake(decision.verdict, decision.confidence, persona) ? persona.stakeUsdc : 0} USDC`);
+  console.log(`[traders]   Verdict: ${decision.verdict} (${decision.confidence}%)`);
+}
+
 /**
  * Claims this trader can still join: open, unexpired, and not already its own.
  *
@@ -276,6 +284,7 @@ async function runTrader(persona: TraderPersona): Promise<void> {
     if (staked >= MAX_STAKES_PER_CYCLE) break;
     const secondOpinion = await buyOracleOpinion(wallet, claim);
     const decision = await decide(persona, claim, secondOpinion);
+    preflightReport(persona, claim.id, decision, balances);
     const take = shouldStake(decision.verdict, decision.confidence, persona);
     console.log(`[traders]   #${claim.id} ${decision.verdict} ${decision.confidence}% ${take ? "→ STAKE" : "→ pass"} · ${decision.reasoning.slice(0, 90)}`);
     if (!take) continue;
